@@ -313,8 +313,8 @@ Hanya mengembalikan model yang benar-benar didukung gateway (`mimo-auto`).
 
 ```bash
 node gateway.js                           # port 3000
-node gateway.js --port 8080               # custom port
-PORT=8080 node gateway.js                 # via env
+node gateway.js --port 9090               # custom port
+PORT=9090 node gateway.js                 # via env
 CHAT_URL="https://..." node gateway.js    # custom upstream
 ```
 

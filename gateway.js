@@ -37,6 +37,7 @@ const PORT = parseInt(
   process.env.PORT || (portIndex !== -1 ? process.argv[portIndex + 1] : "3000"), 10
 );
 const CHAT_URL = process.env.CHAT_URL || "https://api.xiaomimimo.com/api/free-ai/openai/chat";
+const PROXY_URL = process.env.PROXY_URL || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "";
 
 // Model yang didukung gateway — semua request akan di-override ke model ini
 const SUPPORTED_MODELS = ["mimo-auto"];
@@ -46,6 +47,35 @@ const DEFAULT_MODEL = SUPPORTED_MODELS[0];
 
 let cachedJwt = null;
 let jwtExpiresAt = 0;
+
+// ─── Statistik global ───────────────────────────────────────────────────────
+// Akumulasi lintas seluruh lifetime gateway. Dicetak di shutdown dan via
+// endpoint /health?stats=1.
+
+const stats = {
+  startedAt: Date.now(),
+  totalRequests: 0,
+  successRequests: 0,
+  failedRequests: 0,
+  retriedRequests: 0,
+  streamRequests: 0,
+  nonStreamRequests: 0,
+  openaiRequests: 0,
+  anthropicRequests: 0,
+  inputTokens: 0,
+  outputTokens: 0,
+  totalTokens: 0,
+  totalDurationMs: 0,
+  minDurationMs: Number.POSITIVE_INFINITY,
+  maxDurationMs: 0,
+  lastRequestAt: null,
+  recent: [], // snapshot per request, max RECENT_LOG_LIMIT
+  authLog: [], // login/logout events, max AUTH_LOG_LIMIT
+};
+
+const AUTH_LOG_LIMIT = 100;
+
+const RECENT_LOG_LIMIT = 20;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -75,6 +105,57 @@ function parseJwtExp(jwt) {
 
 function resetJwtCache() { cachedJwt = null; jwtExpiresAt = 0; }
 
+// Log auth event (login/logout) ke stats
+function logAuthEvent(type, detail = "") {
+  const event = { type, time: new Date().toISOString(), detail };
+  stats.authLog.push(event);
+  if (stats.authLog.length > AUTH_LOG_LIMIT) stats.authLog.shift();
+  const icon = type === "LOGIN" ? "+" : type === "LOGOUT" ? "-" : "!";
+  console.log(`[${event.time}] ${icon} AUTH ${type}: ${detail}`);
+}
+
+function formatDuration(ms) {
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h > 0) return `${h}h ${m}m ${s % 60}s`;
+  if (m > 0) return `${m}m ${s % 60}s`;
+  return `${s}s`;
+}
+
+// Mask JWT untuk log — tampil prefix + 6 char terakhir, sisipkan '…'
+function maskJwt(jwt) {
+  if (!jwt) return "<none>";
+  if (jwt.length <= 16) return `${jwt.slice(0, 4)}…${jwt.slice(-4)}`;
+  return `${jwt.slice(0, 10)}…${jwt.slice(-6)} (len=${jwt.length})`;
+}
+
+// Decode payload JWT untuk ditampilkan (exp, iat, sub, dll) — best-effort
+function decodeJwtPayload(jwt) {
+  if (!jwt || typeof jwt !== "string") return null;
+  const parts = jwt.split(".");
+  if (parts.length < 2) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString());
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+// Hitung jumlah token dari body OpenAI non-stream atau chunk terakhir.
+// Mengembalikan { input, output, total } — total dihitung jika upstream
+// tidak mengirim total_tokens.
+function extractOpenAITokens(parsed) {
+  if (!parsed || typeof parsed !== "object") return null;
+  const u = parsed.usage;
+  if (!u) return null;
+  const input = Number(u.prompt_tokens) || 0;
+  const output = Number(u.completion_tokens) || 0;
+  const total = Number(u.total_tokens) || input + output;
+  return { input, output, total };
+}
+
 function injectSystemMarker(body) {
   const messages = body?.messages;
   if (!Array.isArray(messages)) return body;
@@ -94,13 +175,25 @@ async function bootstrapJwt() {
   }
   const body = JSON.stringify({ client: generateFingerprint() });
   const { status, data } = await httpsFetch(BOOTSTRAP_URL, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body,
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent": "MiMoCode/1.0",
+      "Origin": "https://api.xiaomimimo.com",
+      "Referer": "https://api.xiaomimimo.com/",
+      "X-Mimo-Source": "mimocode-cli-free",
+    },
+    body,
   });
-  if (status !== 200) throw new Error(`Bootstrap failed: ${status}`);
+  if (status !== 200) {
+    logAuthEvent("LOGOUT", `Bootstrap HTTP ${status}: ${data.slice(0, 200)}`);
+    throw new Error(`Bootstrap failed: ${status} - ${data.slice(0, 100)}`);
+  }
   const parsed = JSON.parse(data);
   if (!parsed.jwt) throw new Error("Bootstrap returned no JWT");
   cachedJwt = parsed.jwt;
   jwtExpiresAt = parseJwtExp(parsed.jwt);
+  logAuthEvent("LOGIN", `JWT obtained | expires ${new Date(jwtExpiresAt).toISOString()} | ${maskJwt(cachedJwt)}`);
   return cachedJwt;
 }
 
@@ -109,6 +202,13 @@ async function bootstrapJwt() {
 function httpsFetch(urlStr, options = {}) {
   const url = new URL(urlStr);
   const lib = url.protocol === "https:" ? https : http;
+
+  // Proxy support — bikin CONNECT tunnel ke proxy dulu
+  const useProxy = PROXY_URL && url.protocol === "https:";
+  if (useProxy) {
+    return httpsFetchViaProxy(url, options);
+  }
+
   return new Promise((resolve, reject) => {
     const opts = {
       hostname: url.hostname,
@@ -130,9 +230,94 @@ function httpsFetch(urlStr, options = {}) {
   });
 }
 
+function httpsFetchViaProxy(url, options = {}) {
+  const proxy = new URL(PROXY_URL);
+  return new Promise((resolve, reject) => {
+    const reqOpts = {
+      hostname: proxy.hostname,
+      port: proxy.port || 8080,
+      method: "CONNECT",
+      path: `${url.hostname}:${url.port || 443}`,
+      timeout: 30000,
+    };
+    const proxyReq = http.request(reqOpts);
+    proxyReq.on("connect", (res, socket) => {
+      if (res.statusCode !== 200) {
+        return reject(new Error(`Proxy CONNECT failed: ${res.statusCode}`));
+      }
+      const tlsOpts = {
+        host: url.hostname,
+        socket,
+        servername: url.hostname,
+        path: url.pathname + url.search,
+        method: options.method || "GET",
+        headers: { ...options.headers },
+        timeout: 60000,
+      };
+      const tlsReq = https.request(tlsOpts, (tlsRes) => {
+        const chunks = [];
+        tlsRes.on("data", c => chunks.push(c));
+        tlsRes.on("end", () => resolve({ status: tlsRes.statusCode, headers: tlsRes.headers, data: Buffer.concat(chunks).toString() }));
+      });
+      tlsReq.on("error", reject);
+      tlsReq.on("timeout", () => { tlsReq.destroy(); reject(new Error("Proxy request timeout")); });
+      if (options.body) tlsReq.write(options.body);
+      tlsReq.end();
+    });
+    proxyReq.on("error", reject);
+    proxyReq.on("timeout", () => { proxyReq.destroy(); reject(new Error("Proxy connect timeout")); });
+    proxyReq.end();
+  });
+}
+
+function httpsFetchStreamViaProxy(url, options) {
+  const proxy = new URL(PROXY_URL);
+  return new Promise((resolve, reject) => {
+    const reqOpts = {
+      hostname: proxy.hostname,
+      port: proxy.port || 8080,
+      method: "CONNECT",
+      path: `${url.hostname}:${url.port || 443}`,
+      timeout: 30000,
+    };
+    const proxyReq = http.request(reqOpts);
+    proxyReq.on("connect", (res, socket) => {
+      if (res.statusCode !== 200) {
+        return reject(new Error(`Proxy CONNECT failed: ${res.statusCode}`));
+      }
+      const tlsOpts = {
+        host: url.hostname,
+        socket,
+        servername: url.hostname,
+        path: url.pathname + url.search,
+        method: options.method || "GET",
+        headers: { ...options.headers },
+        timeout: 120000,
+      };
+      const tlsReq = https.request(tlsOpts, (tlsRes) => {
+        const pass = new PassThrough();
+        tlsRes.pipe(pass);
+        resolve({ status: tlsRes.statusCode, headers: tlsRes.headers, stream: pass });
+      });
+      tlsReq.on("error", reject);
+      tlsReq.on("timeout", () => { tlsReq.destroy(); reject(new Error("Proxy stream timeout")); });
+      if (options.body) tlsReq.write(options.body);
+      tlsReq.end();
+    });
+    proxyReq.on("error", reject);
+    proxyReq.on("timeout", () => { proxyReq.destroy(); reject(new Error("Proxy connect timeout")); });
+    proxyReq.end();
+  });
+}
+
 function httpsFetchStream(urlStr, options) {
   const url = new URL(urlStr);
   const lib = url.protocol === "https:" ? https : http;
+
+  if (PROXY_URL && url.protocol === "https:") {
+    return httpsFetchStreamViaProxy(url, options);
+  }
+
   return new Promise((resolve, reject) => {
     const opts = {
       hostname: url.hostname,
@@ -240,6 +425,7 @@ async function upstreamCall(url, incomingHeaders, bodyStr, stream, sessionId) {
   for (let attempt = 1; attempt <= 2; attempt++) {
     let jwt;
     try { jwt = await bootstrapJwt(); } catch (e) {
+      logAuthEvent("LOGOUT", `Bootstrap failed: ${e.message}`);
       return { status: 502, data: JSON.stringify({ error: `Bootstrap failed: ${e.message}` }) };
     }
 
@@ -253,7 +439,7 @@ async function upstreamCall(url, incomingHeaders, bodyStr, stream, sessionId) {
         if ((result.status === 401 || result.status === 403) && attempt === 1) {
           // Buang stream, reset cache, retry
           result.stream?.resume();
-          console.log(`[${new Date().toISOString()}] Auth fail (${result.status}), retry #${attempt}`);
+          logAuthEvent("LOGOUT", `Auth fail (${result.status}), invalidating JWT`);
           resetJwtCache();
           continue;
         }
@@ -263,7 +449,7 @@ async function upstreamCall(url, incomingHeaders, bodyStr, stream, sessionId) {
           method: "POST", headers, body: bodyStr,
         });
         if ((result.status === 401 || result.status === 403) && attempt === 1) {
-          console.log(`[${new Date().toISOString()}] Auth fail (${result.status}), retry #${attempt}`);
+          logAuthEvent("LOGOUT", `Auth fail (${result.status}), invalidating JWT`);
           resetJwtCache();
           continue;
         }
@@ -746,7 +932,85 @@ const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
 
   if (url.pathname === "/health") {
-    return sendJSON(res, 200, { status: "ok", jwt_cached: !!cachedJwt });
+    return sendJSON(res, 200, {
+      status: "ok",
+      uptime: Math.round((Date.now() - stats.startedAt) / 1000),
+      jwt_cached: !!cachedJwt,
+      total_requests: stats.totalRequests,
+      success: stats.successRequests,
+      failed: stats.failedRequests,
+      tokens: { input: stats.inputTokens, output: stats.outputTokens, total: stats.totalTokens },
+    });
+  }
+
+  if (url.pathname === "/stats") {
+    const uptimeMs = Date.now() - stats.startedAt;
+    const avgDuration = stats.totalRequests > 0
+      ? Math.round(stats.totalDurationMs / stats.totalRequests) : 0;
+    return sendJSON(res, 200, {
+      // ── Ringkasan ──
+      gateway: {
+        status: "ok",
+        port: PORT,
+        upstream: CHAT_URL,
+        startedAt: new Date(stats.startedAt).toISOString(),
+        uptime: formatDuration(uptimeMs),
+        uptimeMs,
+      },
+      // ── Request Stats ──
+      requests: {
+        total: stats.totalRequests,
+        success: stats.successRequests,
+        failed: stats.failedRequests,
+        retried: stats.retriedRequests,
+        stream: stats.streamRequests,
+        nonStream: stats.nonStreamRequests,
+        openai: stats.openaiRequests,
+        anthropic: stats.anthropicRequests,
+      },
+      // ── Token Stats ──
+      tokens: {
+        input: stats.inputTokens,
+        output: stats.outputTokens,
+        total: stats.totalTokens,
+      },
+      // ── Duration Stats ──
+      duration: {
+        avg: avgDuration,
+        min: stats.minDurationMs === Number.POSITIVE_INFINITY ? 0 : stats.minDurationMs,
+        max: stats.maxDurationMs,
+        total: stats.totalDurationMs,
+      },
+      // ── Auth Log (login/logout) ──
+      authLog: stats.authLog.map((e) => ({
+        type: e.type,
+        time: e.time,
+        detail: e.detail,
+      })),
+      // ── Recent Requests ──
+      recent: stats.recent.map((r) => ({
+        time: r.time,
+        status: r.status,
+        model: r.model,
+        stream: r.stream,
+        inputTokens: r.inputTokens,
+        outputTokens: r.outputTokens,
+        durationMs: r.durationMs,
+        protocol: r.protocol,
+      })),
+      // ── Total di Bawah ──
+      totals: {
+        total_requests: stats.totalRequests,
+        total_tokens: stats.totalTokens,
+        total_input_tokens: stats.inputTokens,
+        total_output_tokens: stats.outputTokens,
+        total_duration_ms: stats.totalDurationMs,
+        uptime_seconds: Math.round(uptimeMs / 1000),
+        login_events: stats.authLog.filter((e) => e.type === "LOGIN").length,
+        logout_events: stats.authLog.filter((e) => e.type === "LOGOUT").length,
+        avg_duration_ms: avgDuration,
+      },
+    });
   }
 
   if (url.pathname === "/v1/chat/completions" || url.pathname === "/chat") {
@@ -769,20 +1033,17 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`
-╔══════════════════════════════════════════════════════╗
-║           MiMo Free Gateway — running               ║
-╠══════════════════════════════════════════════════════╣
-║  Listen  : 0.0.0.0:${String(PORT).padEnd(5)}                         ║
-║  Chat    : POST /v1/chat/completions   (OpenAI)     ║
-║  Chat    : POST /v1/messages           (Anthropic)  ║
-║  Health  : GET  /health                             ║
-║                                                     ║
-║  Upstream: ${CHAT_URL}  ║
-║                                                     ║
-║  Agent CLI config:                                  ║
-║    providers.mimo-free.baseUrl =                    ║
-║      http://<IP_KAMU>:${String(PORT).padEnd(5)}/v1/chat/completions     ║
-╚══════════════════════════════════════════════════════╝
+MiMo Free Gateway — running
+${"─".repeat(50)}
+  Listen   : 0.0.0.0:${PORT}
+  Chat     : POST /v1/chat/completions  (OpenAI)
+  Messages : POST /v1/messages          (Anthropic)
+  Health   : GET  /health
+  Stats    : GET  /stats
+${"─".repeat(50)}
+  Upstream : ${CHAT_URL}
+  Proxy    : ${PROXY_URL || "(direct — set PROXY_URL env to use proxy)"}
+  Config   : providers.mimo-free.baseUrl = http://<IP_KAMU>:${PORT}/v1/chat/completions
 `);
 });
 

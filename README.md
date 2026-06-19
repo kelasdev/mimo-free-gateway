@@ -4,20 +4,23 @@
 
 Cukup arahkan `baseUrl` agent CLI ke gateway ini, dan gateway akan menangani:
 
-- ✅ **Model override** — model apapun dari client (`gpt-4`, `claude-3`, dsb.) di-override otomatis ke `mimo-auto`
-- ✅ **Dual API format** — dukung OpenAI (`/v1/chat/completions`) **dan** Anthropic (`/v1/messages`)
-- ✅ **Request/response conversion** — Anthropic ↔ OpenAI otomatis, termasuk streaming SSE
-- ✅ **Model listing** — endpoint `/v1/models` hanya mengembalikan model yang didukung gateway
-- ✅ **Bootstrap JWT** — otomatis dari API MiMo
-- ✅ **Device fingerprint** — dari hardware signature mesin gateway
-- ✅ **Anti-abuse system marker** — auto-inject ke setiap request
-- ✅ **Session affinity** — generate `x-session-affinity` per request
-- ✅ **Forward header client** — `User-Agent`, `Origin`, `Cookie`, `X-Mimo-*`, dll
-- ✅ **Streaming SSE** — proxy langsung (OpenAI) atau konversi ke format Anthropic
-- ✅ **Auth retry** — jika 401/403, reset cache + retry 1x
-- ✅ **CORS** — support preflight, origin bebas
+- **Model override** — model apapun dari client di-override otomatis ke `mimo-auto`
+- **Dual API format** — dukung OpenAI (`/v1/chat/completions`) **dan** Anthropic (`/v1/messages`)
+- **Request/response conversion** — Anthropic <-> OpenAI otomatis, termasuk streaming SSE
+- **Model listing** — endpoint `/v1/models` hanya mengembalikan model yang didukung gateway
+- **Bootstrap JWT** — otomatis dari API MiMo
+- **Device fingerprint** — dari hardware signature mesin gateway
+- **Anti-abuse system marker** — auto-inject ke setiap request
+- **Session affinity** — generate `x-session-affinity` per request
+- **Forward header client** — `User-Agent`, `Origin`, `Cookie`, `X-Mimo-*`, dll
+- **Streaming SSE** — proxy langsung (OpenAI) atau konversi ke format Anthropic
+- **Auth retry** — jika 401/403, reset cache + retry 1x
+- **CORS** — support preflight, origin bebas
+- **Proxy rotation** — auto-rotate SOCKS4/5, HTTP/S via proxy list (baca dari file)
+- **Auto-blacklist** — proxy yang gagal otomatis masuk `blacklist.txt`
+- **Stats & monitoring** — login/logout log, token usage, totals
 
-**Zero dependencies** — hanya pakai built-in Node.js (`http`, `https`, `crypto`, `os`).
+**Zero dependencies** — hanya pakai built-in Node.js (`http`, `https`, `crypto`, `os`, `net`, `tls`, `dns`).
 
 ---
 
@@ -33,17 +36,17 @@ node gateway.js
 Output:
 
 ```
-╔══════════════════════════════════════════════════════╗
-║           MiMo Free Gateway — running               ║
-╠══════════════════════════════════════════════════════╣
-║  Listen  : 0.0.0.0:3000                             ║
-║  Chat    : POST /v1/chat/completions   (OpenAI)     ║
-║  Chat    : POST /v1/messages           (Anthropic)  ║
-║  Models  : GET  /v1/models                          ║
-║  Health  : GET  /health                             ║
-║                                                     ║
-║  Upstream: https://api.xiaomimimo.com/.../openai/chat║
-╚══════════════════════════════════════════════════════╝
+MiMo Free Gateway — running
+──────────────────────────────────────────────────
+  Listen   : 0.0.0.0:3000
+  Chat     : POST /v1/chat/completions  (OpenAI)
+  Messages : POST /v1/messages          (Anthropic)
+  Health   : GET  /health
+  Stats    : GET  /stats
+──────────────────────────────────────────────────
+  Upstream : https://api.xiaomimimo.com/api/free-ai/openai/chat
+  Proxies  : 53 active
+  Config   : providers.mimo-free.baseUrl = http://<IP_KAMU>:3000/v1/chat/completions
 ```
 
 ### 2. Arahkan Agent CLI
@@ -152,6 +155,50 @@ Atau set sebagai default di `settings.json`:
 
 ---
 
+## Proxy Rotation
+
+Gateway mendukung **auto-rotation proxy** untuk bypass rate limit / geo-blocking dari MiMo API.
+
+### Format File Proxy
+
+Buat file `live.txt` atau `proxies.txt` di root project. Satu baris per proxy:
+
+```
+# SOCKS5
+socks5://host:port
+socks5://user:pass@host:port
+
+# SOCKS4
+socks4://host:port
+
+# HTTP/HTTPS proxy (CONNECT tunnel)
+http://host:port
+https://user:pass@host:port
+
+# Tanpa prefix (default HTTP)
+host:port
+```
+
+### Cara Kerja
+
+1. **Startup** — baca semua proxy dari `live.txt` / `proxies.txt`
+2. **Bootstrap JWT** — coba proxy pertama, jika 403/error → auto-rotate ke proxy berikutnya
+3. **Chat/Stream** — semua request lewat proxy aktif
+4. **Blacklist** — proxy yang gagal otomatis ditulis ke `blacklist.txt`, tidak dipakai lagi
+5. **Reload** — `GET /proxy/reload` untuk reload proxy tanpa restart gateway
+
+### Contoh
+
+```bash
+# Jalankan gateway (proxy otomatis dibaca dari live.txt)
+node gateway.js
+
+# Atau custom port
+node gateway.js --port 9090
+```
+
+---
+
 ## Endpoint
 
 | Method | Path | Format | Deskripsi |
@@ -162,8 +209,95 @@ Atau set sebagai default di `settings.json`:
 | `POST` | `/messages` | Anthropic | Alternatif path yang sama |
 | `GET`  | `/v1/models` | OpenAI | Daftar model yang didukung |
 | `GET`  | `/models` | OpenAI | Alternatif path yang sama |
-| `GET`  | `/health` | - | Health check + status JWT cache |
+| `GET`  | `/health` | - | Health check + summary |
+| `GET`  | `/stats` | - | Detail: auth log, token usage, totals |
+| `GET`  | `/proxy/reload` | - | Reload proxy list tanpa restart |
 | `OPTIONS` | `/*` | - | CORS preflight |
+
+---
+
+## Stats & Monitoring
+
+### `GET /health`
+
+Ringkasan cepat:
+
+```json
+{
+  "status": "ok",
+  "uptime": 3600,
+  "jwt_cached": true,
+  "total_requests": 150,
+  "success": 145,
+  "failed": 5,
+  "tokens": { "input": 12500, "output": 8300, "total": 20800 }
+}
+```
+
+### `GET /stats`
+
+Detail lengkap dengan login/logout log dan totals:
+
+```json
+{
+  "gateway": {
+    "status": "ok",
+    "port": 3000,
+    "upstream": "https://api.xiaomimimo.com/...",
+    "startedAt": "2026-06-19T07:07:43.238Z",
+    "uptime": "1h 23m 45s",
+    "proxy": { "protocol": "socks5", "host": "47.79.79.35", "port": 10808 },
+    "proxyCount": 45
+  },
+  "requests": {
+    "total": 150,
+    "success": 145,
+    "failed": 5,
+    "retried": 2,
+    "stream": 120,
+    "nonStream": 30,
+    "openai": 100,
+    "anthropic": 50
+  },
+  "tokens": {
+    "input": 12500,
+    "output": 8300,
+    "total": 20800
+  },
+  "duration": {
+    "avg": 1234,
+    "min": 200,
+    "max": 5678,
+    "total": 185100
+  },
+  "authLog": [
+    { "type": "LOGIN", "time": "2026-06-19T...", "detail": "JWT obtained via socks5://47.79.79.35:10808" },
+    { "type": "LOGOUT", "time": "2026-06-19T...", "detail": "Bootstrap HTTP 403 via socks5://103.77.242.91:1" }
+  ],
+  "recent": [
+    { "time": "2026-06-19T...", "status": 200, "model": "mimo-auto", "stream": true, "inputTokens": 37, "outputTokens": 19, "durationMs": 1200 }
+  ],
+  "totals": {
+    "total_requests": 150,
+    "total_tokens": 20800,
+    "total_input_tokens": 12500,
+    "total_output_tokens": 8300,
+    "total_duration_ms": 185100,
+    "uptime_seconds": 5025,
+    "login_events": 3,
+    "logout_events": 1,
+    "avg_duration_ms": 1234
+  }
+}
+```
+
+### `GET /proxy/reload`
+
+Reload proxy list dari file tanpa restart:
+
+```json
+{ "message": "Proxies reloaded", "active": 45 }
+```
 
 ---
 
@@ -175,7 +309,7 @@ Atau set sebagai default di `settings.json`:
 
 ```json
 {
-  "model": "gpt-4",          ← di-override ke "mimo-auto"
+  "model": "gpt-4",          // di-override ke "mimo-auto"
   "messages": [
     { "role": "system", "content": "Kamu asisten helpful." },
     { "role": "user", "content": "Halo!" }
@@ -213,7 +347,7 @@ Atau set sebagai default di `settings.json`:
 | Parameter | Tipe | Default | Keterangan |
 |-----------|------|---------|------------|
 | `messages` | `array` | **required** | Array pesan (system/user/assistant/tool) |
-| `stream` | `boolean` | `true` | `true` → SSE stream, `false` → JSON |
+| `stream` | `boolean` | `true` | `true` -> SSE stream, `false` -> JSON |
 | `model` | `string` | - | **Selalu di-override** ke `mimo-auto` |
 | `max_tokens` | `number` | - | Maksimal token output |
 
@@ -225,7 +359,7 @@ Atau set sebagai default di `settings.json`:
 
 ```json
 {
-  "model": "claude-3-opus",  ← di-override ke "mimo-auto"
+  "model": "claude-3-opus",  // di-override ke "mimo-auto"
   "system": "Kamu asisten helpful.",
   "messages": [
     { "role": "user", "content": "Halo!" }
@@ -243,10 +377,7 @@ Atau set sebagai default di `settings.json`:
   "type": "message",
   "role": "assistant",
   "content": [
-    {
-      "type": "text",
-      "text": "Halo! Ada yang bisa dibantu?"
-    }
+    { "type": "text", "text": "Halo! Ada yang bisa dibantu?" }
   ],
   "model": "mimo-auto",
   "stop_reason": "end_turn",
@@ -284,7 +415,7 @@ data: {"type":"message_stop"}
 | `messages` | `array` | **required** | Array pesan (user/assistant) |
 | `system` | `string` or `array` | - | System prompt (diubah jadi `role:system`) |
 | `max_tokens` | `number` | **required** | Maksimal token output |
-| `stream` | `boolean` | `true` | `true` → SSE stream, `false` → JSON |
+| `stream` | `boolean` | `true` | `true` -> SSE stream, `false` -> JSON |
 | `model` | `string` | - | **Selalu di-override** ke `mimo-auto` |
 
 ---
@@ -330,71 +461,41 @@ Environment variables:
 ## Arsitektur
 
 ```
-┌──────────────┐     POST /v1/chat/completions     ┌──────────────────┐
-│  Agent CLI   │ ─────────────────────────────────→ │  Gateway-mu      │
-│  (pi / dll)  │     POST /v1/messages              │  0.0.0.0:3000   │
-│              │    (OpenAI atau Anthropic format)   │                  │
-└──────────────┘                                    └────────┬─────────┘
-       ↑                                                     │
-       │   SSE stream / JSON                                 │
-       └─────────────────────────────────────────────────────┘
-                                                            │
-                                ┌────────────────────────────┘
-                                ↓
-                    ┌─────────────────────────────────────────────────────┐
-                    │  0. Model override                                 │
-                    │     model apapun dari client → "mimo-auto"         │
-                    └─────────────────────────────────────────────────────┘
-                                ↓
-                    ┌─────────────────────────────────────────────────────┐
-                    │  0a. Jika Anthropic request → konversi ke OpenAI   │
-                    │      system → role:system, content blocks → string  │
-                    │      stop_reason, usage → mapping                  │
-                    └─────────────────────────────────────────────────────┘
-                                ↓
-                    ┌─────────────────────────────────────┐
-                    │  1. Bootstrap JWT dari MiMo         │
-                    │     POST /api/free-ai/bootstrap     │
-                    │     { client: <fingerprint> }       │
-                    │     → JWT (cache ~50 menit)         │
-                    └──────────┬──────────────────────────┘
-                               ↓
-                    ┌─────────────────────────────────────┐
-                    │  2. Inject system marker            │
-                    │     "You are MiMoCode..."           │
-                    │     → sisipkan ke messages[]        │
-                    └──────────┬──────────────────────────┘
-                               ↓
-                    ┌──────────────────────────────────────────────┐
-                    │  3. Forward ke MiMo Chat API                │
-                    │     POST /api/free-ai/openai/chat           │
-                    │     Authorization: Bearer <jwt>             │
-                    │     X-Mimo-Source: mimocode-cli-free        │
-                    │     x-session-affinity: ses_<random>        │
-                    │     + forward headers dari client asli      │
-                    └──────────┬──────────────────────────────────┘
-                               ↓
-                    ┌──────────────────────────────────────────────┐
-                    │  3a. Jika Anthropic & streaming →            │
-                    │     Konversi SSE OpenAI → Anthropic          │
-                    │     message_start, content_block_delta, dll. │
-                    └──────────────────────────────────────────────┘
-                               ↓
-                    ┌──────────────────────────────────────────────┐
-                    │  4. Jika 401/403                           │
-                    │     → reset JWT cache                      │
-                    │     → bootstrap ulang                      │
-                    │     → retry 1x                             │
-                    └──────────────────────────────────────────────┘
+Agent CLI (pi / dll)
+    |
+    | POST /v1/chat/completions  atau  POST /v1/messages
+    v
+Gateway (0.0.0.0:3000)
+    |
+    |-- [1] Model override: model apapun -> "mimo-auto"
+    |-- [2] Anthropic -> OpenAI conversion (jika perlu)
+    |-- [3] Bootstrap JWT via proxy manager
+    |       |
+    |       |-- Coba proxy pertama dari live.txt
+    |       |-- 403/error? blacklist + rotate ke proxy berikutnya
+    |       |-- Semua gagal? "all proxies exhausted"
+    |       |-- Work? cache JWT ~50 menit
+    |
+    |-- [4] Inject system marker: "You are MiMoCode..."
+    |-- [5] Forward ke MiMo API via proxy
+    |       Authorization: Bearer <JWT>
+    |       X-Mimo-Source: mimocode-cli-free
+    |       x-session-affinity: ses_<random>
+    |
+    |-- [6] Jika Anthropic streaming: konversi SSE OpenAI -> Anthropic
+    |-- [7] Jika 401/403: blacklist proxy + rotate + retry
+    |
+    v
+Response ke Agent CLI (SSE stream atau JSON)
 ```
 
 ---
 
-## Konversi Format (OpenAI ↔ Anthropic)
+## Konversi Format (OpenAI <-> Anthropic)
 
 Gateway melakukan konversi otomatis antara kedua format. Detail:
 
-### Request: Anthropic → OpenAI
+### Request: Anthropic -> OpenAI
 
 | Anthropic | OpenAI |
 |-----------|--------|
@@ -404,7 +505,7 @@ Gateway melakukan konversi otomatis antara kedua format. Detail:
 | `role: "tool"` + `tool_use_id` | `role: "tool"` + `tool_call_id` |
 | `max_tokens` (required) | `max_tokens` (optional) |
 
-### Response: OpenAI → Anthropic (non-stream)
+### Response: OpenAI -> Anthropic (non-stream)
 
 | OpenAI | Anthropic |
 |--------|-----------|
@@ -414,7 +515,7 @@ Gateway melakukan konversi otomatis antara kedua format. Detail:
 | `usage.prompt_tokens` | `usage.input_tokens` |
 | `usage.completion_tokens` | `usage.output_tokens` |
 
-### Streaming: OpenAI SSE → Anthropic SSE
+### Streaming: OpenAI SSE -> Anthropic SSE
 
 | OpenAI event | Anthropic event |
 |-------------|-----------------|
@@ -428,19 +529,24 @@ Gateway melakukan konversi otomatis antara kedua format. Detail:
 
 ```
 mimo/
-├── gateway.js        # ← Gateway server (utama)
-├── mimo-free.js      # ← Executor asli (referensi)
-├── package.json      # Config Node.js (type: module)
-└── README.md         # ← File ini
+├── gateway.js         # Gateway server (utama)
+├── proxy-manager.js   # Proxy rotation manager
+├── mimo-free.js       # Executor asli (referensi)
+├── package.json       # Config Node.js (type: module)
+├── live.txt           # Daftar proxy aktif (SOCKS5/HTTP)
+├── blacklist.txt      # Auto-generated: proxy yang gagal
+└── README.md          # File ini
 ```
 
 ---
 
 ## Catatan
 
-- **Model override**: Semua request, apapun model yang dikirim client (`gpt-4`, `claude-3-opus`, `mimo-v2.5-free`, dsb.), akan di-override ke `mimo-auto` — satu-satunya model yang didukung upstream.
-- **JWT di-cache in-memory** selama ~50 menit (TTL 3000 detik, buffer 5 menit). Restart gateway → cache reset → bootstrap ulang.
+- **Model override**: Semua request, apapun model yang dikirim client, di-override ke `mimo-auto`.
+- **JWT di-cache in-memory** selama ~50 menit. Restart gateway -> cache reset -> bootstrap ulang.
 - **Fingerprint** dibuat dari gabungan `hostname | platform | arch | cpu | username` mesin tempat gateway jalan.
-- Gateway **forward header dari client asli** (`User-Agent`, `Origin`, `Cookie`, `X-Mimo-*`, dll) ke upstream.
+- **Proxy rotation**: gateway coba semua proxy secara berurutan. Proxy yang gagal (403/error) masuk `blacklist.txt` otomatis.
+- **Zero restart**: tambah proxy baru ke `live.txt`, lalu `GET /proxy/reload` — gateway langsung pakai.
+- Gateway **forward header dari client asli** ke upstream.
 - Gateway **tidak menyimpan log chat** — hanya forward request.
 - Untuk production, jalankan di belakang **nginx** atau **PM2**.

@@ -21,6 +21,10 @@ import https from "https";
 import { createHash } from "crypto";
 import os from "os";
 import { PassThrough } from "stream";
+import {
+  initProxyManager, proxyFetch, proxyFetchStream, rotateProxy,
+  getProxyInfo, getProxyCount, reloadProxies,
+} from "./proxy-manager.js";
 
 // ─── Konfigurasi ────────────────────────────────────────────────────────────
 
@@ -37,7 +41,6 @@ const PORT = parseInt(
   process.env.PORT || (portIndex !== -1 ? process.argv[portIndex + 1] : "3000"), 10
 );
 const CHAT_URL = process.env.CHAT_URL || "https://api.xiaomimimo.com/api/free-ai/openai/chat";
-const PROXY_URL = process.env.PROXY_URL || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "";
 
 // Model yang didukung gateway — semua request akan di-override ke model ini
 const SUPPORTED_MODELS = ["mimo-auto"];
@@ -174,170 +177,55 @@ async function bootstrapJwt() {
     return cachedJwt;
   }
   const body = JSON.stringify({ client: generateFingerprint() });
-  const { status, data } = await httpsFetch(BOOTSTRAP_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": "MiMoCode/1.0",
-      "Origin": "https://api.xiaomimimo.com",
-      "Referer": "https://api.xiaomimimo.com/",
-      "X-Mimo-Source": "mimocode-cli-free",
-    },
-    body,
-  });
-  if (status !== 200) {
-    logAuthEvent("LOGOUT", `Bootstrap HTTP ${status}: ${data.slice(0, 200)}`);
-    throw new Error(`Bootstrap failed: ${status} - ${data.slice(0, 100)}`);
-  }
-  const parsed = JSON.parse(data);
-  if (!parsed.jwt) throw new Error("Bootstrap returned no JWT");
-  cachedJwt = parsed.jwt;
-  jwtExpiresAt = parseJwtExp(parsed.jwt);
-  logAuthEvent("LOGIN", `JWT obtained | expires ${new Date(jwtExpiresAt).toISOString()} | ${maskJwt(cachedJwt)}`);
-  return cachedJwt;
-}
+  const headers = {
+    "Content-Type": "application/json",
+    "User-Agent": "MiMoCode/1.0",
+    "Origin": "https://api.xiaomimimo.com",
+    "Referer": "https://api.xiaomimimo.com/",
+    "X-Mimo-Source": "mimocode-cli-free",
+  };
 
-// ─── HTTP Clients ───────────────────────────────────────────────────────────
+  // Auto-rotate proxy on failure
+  const maxAttempts = Math.max(getProxyCount(), 1);
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const proxy = getProxyInfo();
+    const proxyLabel = proxy ? proxy.raw : "direct";
 
-function httpsFetch(urlStr, options = {}) {
-  const url = new URL(urlStr);
-  const lib = url.protocol === "https:" ? https : http;
+    let status, data;
+    try {
+      const resp = await proxyFetch(BOOTSTRAP_URL, { method: "POST", headers, body });
+      status = resp.status;
+      data = resp.data;
+    } catch (err) {
+      logAuthEvent("LOGOUT", `Bootstrap error (${proxyLabel}): ${err.message}`);
+      const next = rotateProxy(`error: ${err.message}`);
+      if (!next) throw new Error(`Bootstrap failed: ${err.message}`);
+      continue;
+    }
 
-  // Proxy support — bikin CONNECT tunnel ke proxy dulu
-  const useProxy = PROXY_URL && url.protocol === "https:";
-  if (useProxy) {
-    return httpsFetchViaProxy(url, options);
-  }
-
-  return new Promise((resolve, reject) => {
-    const opts = {
-      hostname: url.hostname,
-      port: url.port || (url.protocol === "https:" ? 443 : 80),
-      path: url.pathname + url.search,
-      method: options.method || "GET",
-      headers: { ...options.headers },
-      timeout: 60000,
-    };
-    const req = lib.request(opts, (res) => {
-      const chunks = [];
-      res.on("data", c => chunks.push(c));
-      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, data: Buffer.concat(chunks).toString() }));
-    });
-    req.on("error", reject);
-    req.on("timeout", () => { req.destroy(); reject(new Error("Request timeout")); });
-    if (options.body) req.write(options.body);
-    req.end();
-  });
-}
-
-function httpsFetchViaProxy(url, options = {}) {
-  const proxy = new URL(PROXY_URL);
-  return new Promise((resolve, reject) => {
-    const reqOpts = {
-      hostname: proxy.hostname,
-      port: proxy.port || 8080,
-      method: "CONNECT",
-      path: `${url.hostname}:${url.port || 443}`,
-      timeout: 30000,
-    };
-    const proxyReq = http.request(reqOpts);
-    proxyReq.on("connect", (res, socket) => {
-      if (res.statusCode !== 200) {
-        return reject(new Error(`Proxy CONNECT failed: ${res.statusCode}`));
+    if (status !== 200) {
+      const isAuth = status === 401 || status === 403;
+      logAuthEvent("LOGOUT", `Bootstrap HTTP ${status} via ${proxyLabel}: ${data.slice(0, 120)}`);
+      if (isAuth) {
+        const next = rotateProxy(`HTTP ${status}`);
+        if (!next) throw new Error(`Bootstrap failed: ${status} — all proxies exhausted`);
+        continue; // retry with next proxy
       }
-      const tlsOpts = {
-        host: url.hostname,
-        socket,
-        servername: url.hostname,
-        path: url.pathname + url.search,
-        method: options.method || "GET",
-        headers: { ...options.headers },
-        timeout: 60000,
-      };
-      const tlsReq = https.request(tlsOpts, (tlsRes) => {
-        const chunks = [];
-        tlsRes.on("data", c => chunks.push(c));
-        tlsRes.on("end", () => resolve({ status: tlsRes.statusCode, headers: tlsRes.headers, data: Buffer.concat(chunks).toString() }));
-      });
-      tlsReq.on("error", reject);
-      tlsReq.on("timeout", () => { tlsReq.destroy(); reject(new Error("Proxy request timeout")); });
-      if (options.body) tlsReq.write(options.body);
-      tlsReq.end();
-    });
-    proxyReq.on("error", reject);
-    proxyReq.on("timeout", () => { proxyReq.destroy(); reject(new Error("Proxy connect timeout")); });
-    proxyReq.end();
-  });
-}
+      throw new Error(`Bootstrap failed: ${status} - ${data.slice(0, 100)}`);
+    }
 
-function httpsFetchStreamViaProxy(url, options) {
-  const proxy = new URL(PROXY_URL);
-  return new Promise((resolve, reject) => {
-    const reqOpts = {
-      hostname: proxy.hostname,
-      port: proxy.port || 8080,
-      method: "CONNECT",
-      path: `${url.hostname}:${url.port || 443}`,
-      timeout: 30000,
-    };
-    const proxyReq = http.request(reqOpts);
-    proxyReq.on("connect", (res, socket) => {
-      if (res.statusCode !== 200) {
-        return reject(new Error(`Proxy CONNECT failed: ${res.statusCode}`));
-      }
-      const tlsOpts = {
-        host: url.hostname,
-        socket,
-        servername: url.hostname,
-        path: url.pathname + url.search,
-        method: options.method || "GET",
-        headers: { ...options.headers },
-        timeout: 120000,
-      };
-      const tlsReq = https.request(tlsOpts, (tlsRes) => {
-        const pass = new PassThrough();
-        tlsRes.pipe(pass);
-        resolve({ status: tlsRes.statusCode, headers: tlsRes.headers, stream: pass });
-      });
-      tlsReq.on("error", reject);
-      tlsReq.on("timeout", () => { tlsReq.destroy(); reject(new Error("Proxy stream timeout")); });
-      if (options.body) tlsReq.write(options.body);
-      tlsReq.end();
-    });
-    proxyReq.on("error", reject);
-    proxyReq.on("timeout", () => { proxyReq.destroy(); reject(new Error("Proxy connect timeout")); });
-    proxyReq.end();
-  });
-}
-
-function httpsFetchStream(urlStr, options) {
-  const url = new URL(urlStr);
-  const lib = url.protocol === "https:" ? https : http;
-
-  if (PROXY_URL && url.protocol === "https:") {
-    return httpsFetchStreamViaProxy(url, options);
+    const parsed = JSON.parse(data);
+    if (!parsed.jwt) throw new Error("Bootstrap returned no JWT");
+    cachedJwt = parsed.jwt;
+    jwtExpiresAt = parseJwtExp(parsed.jwt);
+    logAuthEvent("LOGIN", `JWT obtained via ${proxyLabel} | expires ${new Date(jwtExpiresAt).toISOString()} | ${maskJwt(cachedJwt)}`);
+    return cachedJwt;
   }
 
-  return new Promise((resolve, reject) => {
-    const opts = {
-      hostname: url.hostname,
-      port: url.port || (url.protocol === "https:" ? 443 : 80),
-      path: url.pathname + url.search,
-      method: options.method || "GET",
-      headers: { ...options.headers },
-      timeout: 120000,
-    };
-    const req = lib.request(opts, (res) => {
-      const pass = new PassThrough();
-      res.pipe(pass);
-      resolve({ status: res.statusCode, headers: res.headers, stream: pass });
-    });
-    req.on("error", reject);
-    req.on("timeout", () => { req.destroy(); reject(new Error("Stream timeout")); });
-    if (options.body) req.write(options.body);
-    req.end();
-  });
+  throw new Error("Bootstrap failed: all proxies exhausted");
 }
+
+// HTTP clients — handled by proxy-manager.js (proxyFetch, proxyFetchStream)
 
 // ─── Build upstream headers ─────────────────────────────────────────────────
 
@@ -433,23 +321,24 @@ async function upstreamCall(url, incomingHeaders, bodyStr, stream, sessionId) {
 
     try {
       if (stream) {
-        const result = await httpsFetchStream(url, {
+        const result = await proxyFetchStream(url, {
           method: "POST", headers, body: bodyStr,
         });
         if ((result.status === 401 || result.status === 403) && attempt === 1) {
-          // Buang stream, reset cache, retry
           result.stream?.resume();
           logAuthEvent("LOGOUT", `Auth fail (${result.status}), invalidating JWT`);
+          rotateProxy(`auth fail ${result.status}`);
           resetJwtCache();
           continue;
         }
         return { status: result.status, data: "", stream: result.stream };
       } else {
-        const result = await httpsFetch(url, {
+        const result = await proxyFetch(url, {
           method: "POST", headers, body: bodyStr,
         });
         if ((result.status === 401 || result.status === 403) && attempt === 1) {
           logAuthEvent("LOGOUT", `Auth fail (${result.status}), invalidating JWT`);
+          rotateProxy(`auth fail ${result.status}`);
           resetJwtCache();
           continue;
         }
@@ -457,6 +346,7 @@ async function upstreamCall(url, incomingHeaders, bodyStr, stream, sessionId) {
       }
     } catch (e) {
       if (attempt === 2) return { status: 502, data: JSON.stringify({ error: e.message }) };
+      rotateProxy(`error: ${e.message}`);
       console.log(`[${new Date().toISOString()}] Error, retry #${attempt}: ${e.message}`);
     }
   }
@@ -956,6 +846,8 @@ const server = http.createServer((req, res) => {
         startedAt: new Date(stats.startedAt).toISOString(),
         uptime: formatDuration(uptimeMs),
         uptimeMs,
+        proxy: getProxyInfo(),
+        proxyCount: getProxyCount(),
       },
       // ── Request Stats ──
       requests: {
@@ -1028,8 +920,17 @@ const server = http.createServer((req, res) => {
     return handleAnthropicMessages(req, res);
   }
 
+  // Reload proxies from file
+  if (url.pathname === "/proxy/reload") {
+    const count = reloadProxies();
+    return sendJSON(res, 200, { message: "Proxies reloaded", active: count });
+  }
+
   sendJSON(res, 404, { error: "Not found. Use POST /v1/chat/completions or /v1/messages" });
 });
+
+// ─── Init proxy manager ────────────────────────────────────────────────────
+initProxyManager();
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`
@@ -1042,7 +943,7 @@ ${"─".repeat(50)}
   Stats    : GET  /stats
 ${"─".repeat(50)}
   Upstream : ${CHAT_URL}
-  Proxy    : ${PROXY_URL || "(direct — set PROXY_URL env to use proxy)"}
+  Proxies  : ${getProxyCount()} active
   Config   : providers.mimo-free.baseUrl = http://<IP_KAMU>:${PORT}/v1/chat/completions
 `);
 });

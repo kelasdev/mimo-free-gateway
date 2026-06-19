@@ -1,0 +1,12 @@
+{
+  "name": "mimo-free-gateway",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "description": "Gateway proxy for MiMo Free API — agent CLI cukup arahkan base URL ke sini",
+  "main": "gateway.js",
+  "scripts": {
+    "start": "node gateway.js",
+    "start:dev": "node --watch gateway.js"
+  }
+}

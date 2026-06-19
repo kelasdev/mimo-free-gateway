@@ -8,5 +8,10 @@
   "scripts": {
     "start": "node gateway.js",
     "start:dev": "node --watch gateway.js"
+  },
+  "dependencies": {
+    "https-proxy-agent": "^9.1.0",
+    "socks": "^2.8.9",
+    "socks-proxy-agent": "^10.1.0"
   }
 }

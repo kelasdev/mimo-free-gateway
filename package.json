@@ -7,7 +7,10 @@
   "main": "gateway.js",
   "scripts": {
     "start": "node gateway.js",
-    "start:dev": "node --watch gateway.js"
+    "start:dev": "node --watch gateway.js",
+    "check": "node proxy-checker.js",
+    "check:verbose": "node proxy-checker.js --verbose",
+    "check:json": "node proxy-checker.js --json --no-output"
   },
   "dependencies": {
     "https-proxy-agent": "^9.1.0",

@@ -26,6 +26,17 @@ import {
   getProxyInfo, getProxyCount, reloadProxies,
 } from "./proxy-manager.js";
 
+// ─── ANSI Colors ────────────────────────────────────────────────────────────
+const C = {
+  reset: "\x1b[0m", dim: "\x1b[2m", bold: "\x1b[1m",
+  red: "\x1b[31m", green: "\x1b[32m", yellow: "\x1b[33m",
+  blue: "\x1b[34m", cyan: "\x1b[36m", gray: "\x1b[90m",
+  white: "\x1b[37m", magenta: "\x1b[35m",
+};
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+function fmtNum(n) { return Number(n).toLocaleString("en-US"); }
+
 // ─── Konfigurasi ────────────────────────────────────────────────────────────
 
 const BOOTSTRAP_URL = "https://api.xiaomimimo.com/api/free-ai/bootstrap";
@@ -72,6 +83,8 @@ const stats = {
   minDurationMs: Number.POSITIVE_INFINITY,
   maxDurationMs: 0,
   lastRequestAt: null,
+  requestBytes: 0,   // total bytes sent (request body)
+  responseBytes: 0,  // total bytes received (response body)
   recent: [], // snapshot per request, max RECENT_LOG_LIMIT
   authLog: [], // login/logout events, max AUTH_LOG_LIMIT
 };
@@ -113,8 +126,9 @@ function logAuthEvent(type, detail = "") {
   const event = { type, time: new Date().toISOString(), detail };
   stats.authLog.push(event);
   if (stats.authLog.length > AUTH_LOG_LIMIT) stats.authLog.shift();
-  const icon = type === "LOGIN" ? "+" : type === "LOGOUT" ? "-" : "!";
-  console.log(`[${event.time}] ${icon} AUTH ${type}: ${detail}`);
+  const icon = type === "LOGIN" ? `${C.green}+${C.reset}` : type === "LOGOUT" ? `${C.red}-${C.reset}` : `${C.yellow}!${C.reset}`;
+  const tag = type === "LOGIN" ? `${C.green}LOGIN ${C.reset}` : type === "LOGOUT" ? `${C.red}LOGOUT${C.reset}` : `${C.yellow}AUTH  ${C.reset}`;
+  console.log(`  ${icon} ${tag} ${detail}`);
 }
 
 function formatDuration(ms) {
@@ -131,6 +145,26 @@ function maskJwt(jwt) {
   if (!jwt) return "<none>";
   if (jwt.length <= 16) return `${jwt.slice(0, 4)}…${jwt.slice(-4)}`;
   return `${jwt.slice(0, 10)}…${jwt.slice(-6)} (len=${jwt.length})`;
+}
+
+// Format bytes ke human-readable (KB/MB)
+function fmtBytes(bytes) {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)}MB`;
+}
+
+// Print summary bar — cumulative net & tokens
+function printSummary() {
+  const inBytes = stats.requestBytes;
+  const outBytes = stats.responseBytes;
+  const totalBytes = inBytes + outBytes;
+  const inTok = stats.inputTokens;
+  const outTok = stats.outputTokens;
+  const totalTok = stats.totalTokens;
+  console.log(
+    `     ${C.gray}net:${C.reset} ${C.cyan}${fmtBytes(inBytes)}${C.reset} ${C.gray}/${C.reset} ${C.magenta}${fmtBytes(outBytes)}${C.reset} ${C.gray}=${C.reset} ${C.bold}${fmtBytes(totalBytes)}${C.reset} │ ${C.gray}tok:${C.reset} ${C.cyan}${fmtNum(inTok)}${C.reset} ${C.gray}/${C.reset} ${C.magenta}${fmtNum(outTok)}${C.reset} ${C.gray}=${C.reset} ${C.bold}${fmtNum(totalTok)}${C.reset}`
+  );
 }
 
 // Decode payload JWT untuk ditampilkan (exp, iat, sub, dll) — best-effort
@@ -281,12 +315,36 @@ async function handleChat(req, res) {
   const transformedBody = injectSystemMarker(body);
   const bodyStr = JSON.stringify(transformedBody);
 
-  console.log(`[${new Date().toISOString()}] → ${CHAT_URL} | stream=${stream} | model="${originalModel}"→"${DEFAULT_MODEL}" | body=${(bodyStr.length / 1024).toFixed(1)}KB | session=${sessionId}`);
+  const startTime = Date.now();
+  const proxy = getProxyInfo();
+  const proxyLabel = proxy ? proxy.raw : "direct";
+
+  console.log(`  ${C.blue}=>${C.reset}  ${C.bold}POST${C.reset} ${C.cyan}${CHAT_URL}${C.reset}`);
+  const bodyKB = (bodyStr.length / 1024).toFixed(1);
+  const msgCount = body.messages?.length || 0;
+  console.log(`     ${C.gray}model:${C.reset} ${originalModel}${C.dim}->${C.reset}${C.green}${DEFAULT_MODEL}${C.reset}  ${C.gray}msgs:${C.reset} ${msgCount}  ${C.gray}size:${C.reset} ${C.bold}${bodyKB}KB${C.reset}  ${C.gray}stream:${C.reset} ${stream}`);
+  console.log(`     ${C.gray}session:${C.reset} ${sessionId}  ${C.gray}proxy:${C.reset} ${proxyLabel}`);
 
   // Upstream forward — retry 1x kalo 401/403
   const { status, data, stream: upStream } = await upstreamCall(
     CHAT_URL, req.headers, bodyStr, stream, sessionId
   );
+
+  const durationMs = Date.now() - startTime;
+  stats.totalRequests++;
+  stats.totalDurationMs += durationMs;
+  if (durationMs < stats.minDurationMs) stats.minDurationMs = durationMs;
+  if (durationMs > stats.maxDurationMs) stats.maxDurationMs = durationMs;
+  stats.lastRequestAt = Date.now();
+  if (stream) stats.streamRequests++; else stats.nonStreamRequests++;
+  stats.openaiRequests++;
+  stats.requestBytes += Buffer.byteLength(bodyStr);
+
+  if (status >= 200 && status < 300) {
+    stats.successRequests++;
+  } else {
+    stats.failedRequests++;
+  }
 
   if (stream) {
     if (upStream) {
@@ -296,12 +354,92 @@ async function handleChat(req, res) {
         "Connection": "keep-alive",
         "Access-Control-Allow-Origin": "*",
       });
-      upStream.pipe(res);
+      // Intercept stream untuk extract tokens dari chunk terakhir
+      let streamBuf = "";
+      let inTokens = { input: 0, output: 0 };
+      let responseBytes = 0;
+      upStream.on("data", (chunk) => {
+        res.write(chunk);
+        responseBytes += chunk.length;
+        streamBuf += chunk.toString();
+        // Parse token dari chunk terakhir
+        const lines = streamBuf.split("\n");
+        streamBuf = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.startsWith("data:")) continue;
+          const d = line.startsWith("data: ") ? line.slice(6).trim() : line.slice(5).trim();
+          if (d === "[DONE]") continue;
+          try {
+            const parsed = JSON.parse(d);
+            if (parsed.usage) {
+              inTokens.input = parsed.usage.prompt_tokens || inTokens.input;
+              inTokens.output = parsed.usage.completion_tokens || inTokens.output;
+            }
+          } catch { /* ignore */ }
+        }
+      });
+      upStream.on("end", () => {
+        // Parse sisa buffer terakhir
+        if (streamBuf.trim()) {
+          const lines = streamBuf.split("\n");
+          for (const line of lines) {
+            if (!line.startsWith("data:")) continue;
+            const d = line.startsWith("data: ") ? line.slice(6).trim() : line.slice(5).trim();
+            if (d === "[DONE]") continue;
+            try {
+              const parsed = JSON.parse(d);
+              if (parsed.usage) {
+                inTokens.input = parsed.usage.prompt_tokens || inTokens.input;
+                inTokens.output = parsed.usage.completion_tokens || inTokens.output;
+              }
+            } catch { /* ignore */ }
+          }
+        }
+        if (inTokens.input > 0 || inTokens.output > 0) {
+          stats.inputTokens += inTokens.input;
+          stats.outputTokens += inTokens.output;
+          stats.totalTokens += inTokens.input + inTokens.output;
+        }
+        stats.responseBytes += responseBytes;
+        res.end();
+        const sc = status < 400 ? C.green : C.red;
+        const resKB = (responseBytes / 1024).toFixed(1);
+        console.log(`  ${C.blue}<=${C.reset}  ${sc}${status}${C.reset} ${C.gray}${durationMs}ms${C.reset} │ ${C.cyan}input:${fmtNum(inTokens.input)}${C.reset} ${C.magenta}output:${fmtNum(inTokens.output)}${C.reset} ${C.bold}total:${fmtNum(inTokens.input + inTokens.output)}${C.reset} │ ${C.gray}res:${resKB}KB${C.reset} │ ${proxyLabel}`);
+        printSummary();
+      });
+      upStream.on("error", () => {
+        res.end();
+        console.log(`  ${C.red}<=${C.reset}  ${status} stream-error ${C.gray}${durationMs}ms${C.reset}`);
+        printSummary();
+      });
     } else {
       sendJSON(res, status, { error: "Upstream returned no stream", detail: data });
+      console.log(`  ${C.red}<=${C.reset}  ${status} error ${C.gray}${durationMs}ms${C.reset}`);
+      printSummary();
     }
   } else {
     sendJSON(res, status, data);
+    const resKB = (data.length / 1024).toFixed(1);
+    stats.responseBytes += Buffer.byteLength(data);
+    // Extract tokens dari non-stream response
+    try {
+      const parsed = typeof data === "string" ? JSON.parse(data) : data;
+      const tokens = extractOpenAITokens(parsed);
+      if (tokens) {
+        stats.inputTokens += tokens.input;
+        stats.outputTokens += tokens.output;
+        stats.totalTokens += tokens.total;
+        const sc = status < 400 ? C.green : C.red;
+        console.log(`  ${C.blue}<=${C.reset}  ${sc}${status}${C.reset} ${C.gray}${durationMs}ms${C.reset} │ ${C.cyan}input:${fmtNum(tokens.input)}${C.reset} ${C.magenta}output:${fmtNum(tokens.output)}${C.reset} ${C.bold}total:${fmtNum(tokens.total)}${C.reset} │ ${C.gray}res:${resKB}KB${C.reset} │ ${proxyLabel}`);
+      } else {
+        const sc = status < 400 ? C.green : C.red;
+        console.log(`  ${C.blue}<=${C.reset}  ${sc}${status}${C.reset} ${C.gray}${durationMs}ms${C.reset} │ ${C.gray}res:${resKB}KB${C.reset} │ ${proxyLabel}`);
+      }
+    } catch {
+      const sc = status < 400 ? C.green : C.red;
+      console.log(`  ${C.blue}<=${C.reset}  ${sc}${status}${C.reset} ${C.gray}${durationMs}ms${C.reset} │ ${C.gray}res:${resKB}KB${C.reset} │ ${proxyLabel}`);
+    }
+    printSummary();
   }
 }
 
@@ -347,6 +485,7 @@ async function upstreamCall(url, incomingHeaders, bodyStr, stream, sessionId) {
     } catch (e) {
       if (attempt === 2) return { status: 502, data: JSON.stringify({ error: e.message }) };
       rotateProxy(`error: ${e.message}`);
+      resetJwtCache(); // clear stale JWT so next attempt bootstraps via new proxy
       console.log(`[${new Date().toISOString()}] Error, retry #${attempt}: ${e.message}`);
     }
   }
@@ -934,19 +1073,35 @@ initProxyManager();
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`
-MiMo Free Gateway — running
-${"─".repeat(50)}
-  Listen   : 0.0.0.0:${PORT}
-  Chat     : POST /v1/chat/completions  (OpenAI)
-  Messages : POST /v1/messages          (Anthropic)
-  Health   : GET  /health
-  Stats    : GET  /stats
-${"─".repeat(50)}
-  Upstream : ${CHAT_URL}
-  Proxies  : ${getProxyCount()} active
-  Config   : providers.mimo-free.baseUrl = http://<IP_KAMU>:${PORT}/v1/chat/completions
+${C.bold}${C.cyan}MiMo Free Gateway${C.reset} ${C.green}running${C.reset}
+${C.gray}${"─".repeat(50)}${C.reset}
+  ${C.gray}Listen${C.reset}   0.0.0.0:${PORT}
+  ${C.gray}Chat${C.reset}     POST /v1/chat/completions  ${C.dim}(OpenAI)${C.reset}
+  ${C.gray}Messages${C.reset} POST /v1/messages          ${C.dim}(Anthropic)${C.reset}
+  ${C.gray}Health${C.reset}   GET  /health
+  ${C.gray}Stats${C.reset}    GET  /stats
+  ${C.gray}Reload${C.reset}   GET  /proxy/reload
+${C.gray}${"─".repeat(50)}${C.reset}
+  ${C.gray}Upstream${C.reset} ${CHAT_URL}
+  ${C.gray}Proxy${C.reset}    ${C.bold}${getProxyCount()}${C.reset} active
+  ${C.gray}Config${C.reset}   providers.mimo-free.baseUrl = http://<IP_KAMU>:${PORT}/v1/chat/completions
 `);
 });
 
-process.on("SIGINT", () => { resetJwtCache(); server.close(() => process.exit(0)); });
-process.on("SIGTERM", () => server.close(() => process.exit(0)));
+// ─── Active connections tracker (for clean force-exit) ──────────────────────
+const liveConnections = new Set();
+server.on("connection", (sock) => { liveConnections.add(sock); sock.on("close", () => liveConnections.delete(sock)); });
+
+// ─── Graceful shutdown with hard fallback ────────────────────────────────────
+function shutdown(signal) {
+  console.log(`\n${C.yellow}${signal} received${C.reset} — shutting down...`);
+  resetJwtCache();
+  // Force-destroy every open socket so SSE streams don't block
+  for (const sock of liveConnections) { try { sock.destroy(); } catch {} }
+  liveConnections.clear();
+  server.close(() => process.exit(0));
+  // Hard kill if server.close() still hangs
+  setTimeout(() => process.exit(1), 2000);
+}
+process.on("SIGINT",  () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));

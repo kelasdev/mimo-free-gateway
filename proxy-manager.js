@@ -20,6 +20,25 @@ import { HttpsProxyAgent } from "https-proxy-agent";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// ─── ANSI Colors ────────────────────────────────────────────────────────────
+const C = {
+  reset: "\x1b[0m",
+  dim: "\x1b[2m",
+  bold: "\x1b[1m",
+  red: "\x1b[31m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  blue: "\x1b[34m",
+  magenta: "\x1b[35m",
+  cyan: "\x1b[36m",
+  white: "\x1b[37m",
+  gray: "\x1b[90m",
+  bgRed: "\x1b[41m",
+  bgGreen: "\x1b[42m",
+  bgYellow: "\x1b[43m",
+  bgBlue: "\x1b[44m",
+};
+
 // ─── State ──────────────────────────────────────────────────────────────────
 
 let allProxies = [];       // [{protocol, host, port, user, pass, raw, url}]
@@ -105,7 +124,7 @@ export function initProxyManager(proxyFile) {
 
   allProxies = found.filter((p) => !blacklist.has(p.raw));
   currentIndex = 0;
-  console.log(`[proxy] Loaded ${found.length} proxies (${allProxies.length} active, ${blacklist.size} blacklisted)`);
+  console.log(`  ${C.cyan}[proxy]${C.reset} Loaded  ${C.bold}${found.length}${C.reset} total │ ${C.green}${allProxies.length} active${C.reset} │ ${C.red}${blacklist.size} blacklisted${C.reset}`);
   return allProxies.length;
 }
 
@@ -119,7 +138,8 @@ export function getProxyCount() { return allProxies.length; }
 export function rotateProxy(reason) {
   if (allProxies.length === 0) return null;
   const current = allProxies[currentIndex % allProxies.length];
-  console.log(`[proxy] Rotating: ${current.raw} — reason: ${reason}`);
+  console.log(`  ${C.yellow}[proxy]${C.reset} Rotate  ${C.red}${current.raw}${C.reset}`);
+  console.log(`           ${C.gray}reason:${C.reset} ${reason}`);
   saveBlacklist(current);
 
   const start = currentIndex;
@@ -129,10 +149,10 @@ export function rotateProxy(reason) {
   } while (blacklist.has(allProxies[currentIndex]?.raw));
 
   allProxies = allProxies.filter((p) => !blacklist.has(p.raw));
-  if (allProxies.length === 0) { console.log("[proxy] All proxies blacklisted!"); return null; }
+  if (allProxies.length === 0) { console.log(`  ${C.red}[proxy]${C.reset} All proxies blacklisted!`); return null; }
 
   const next = allProxies[currentIndex % allProxies.length];
-  console.log(`[proxy] Now using: ${next.raw} (${allProxies.length} remaining)`);
+  console.log(`  ${C.green}[proxy]${C.reset} Now     ${C.bold}${next.raw}${C.reset} │ ${C.green}${allProxies.length} remaining${C.reset} │ ${C.red}${blacklist.size} blacklisted${C.reset}`);
   return next;
 }
 
@@ -149,7 +169,7 @@ export function reloadProxies(proxyFile) {
     }
   }
   allProxies = found.filter((p) => !blacklist.has(p.raw));
-  console.log(`[proxy] Reloaded: ${allProxies.length} active`);
+  console.log(`  ${C.cyan}[proxy]${C.reset} Reloaded ${C.bold}${found.length}${C.reset} total │ ${C.green}${allProxies.length} active${C.reset} │ ${C.red}${blacklist.size} blacklisted${C.reset}`);
   return allProxies.length;
 }
 

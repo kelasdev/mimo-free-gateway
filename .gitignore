@@ -2,3 +2,4 @@ live.txt
 blacklist.txt
 live-validated.txt
 proxy_sources.txt
+node_modules/*

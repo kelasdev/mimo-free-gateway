@@ -1102,15 +1102,29 @@ const liveConnections = new Set();
 server.on("connection", (sock) => { liveConnections.add(sock); sock.on("close", () => liveConnections.delete(sock)); });
 
 // ─── Graceful shutdown with hard fallback ────────────────────────────────────
+let shuttingDown = false;
 function shutdown(signal) {
+  if (shuttingDown) process.exit(1); // double Ctrl+C = instant kill
+  shuttingDown = true;
+
   console.log(`\n${C.yellow}${signal} received${C.reset} — shutting down...`);
   resetJwtCache();
+
   // Force-destroy every open socket so SSE streams don't block
   for (const sock of liveConnections) { try { sock.destroy(); } catch {} }
   liveConnections.clear();
+
+  // Node 18.2+: force-close ALL HTTP connections (SSE streams, keep-alive, etc.)
+  if (typeof server.closeAllConnections === "function") {
+    server.closeAllConnections();
+  }
+
   server.close(() => process.exit(0));
-  // Hard kill if server.close() still hangs
-  setTimeout(() => process.exit(1), 2000);
+
+  // Hard kill — guaranteed exit even if something hangs
+  setTimeout(() => process.exit(1), 1000);
 }
 process.on("SIGINT",  () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
+// Windows: Ctrl+Break or taskkill /SIG
+process.on("SIGBREAK", () => shutdown("SIGBREAK"));

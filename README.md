@@ -442,19 +442,34 @@ Hanya mengembalikan model yang benar-benar didukung gateway (`mimo-auto`).
 
 ## Opsi
 
+### Gateway
+
 ```bash
-node gateway.js                           # port 3000
+node gateway.js                           # port 3000, default upstream
 node gateway.js --port 9090               # custom port
+node gateway.js --chat-url "https://..."  # custom upstream endpoint
+node gateway.js --proxy proxies.txt       # custom proxy list file
+node gateway.js --help                    # tampilkan semua opsi
 PORT=9090 node gateway.js                 # via env
-CHAT_URL="https://..." node gateway.js    # custom upstream
+CHAT_URL="https://..." node gateway.js    # custom upstream via env
 ```
 
-Environment variables:
+| Flag | Env | Default | Deskripsi |
+|------|-----|---------|-----------|
+| `--port` | `PORT` | `3000` | Port listen |
+| `--chat-url` | `CHAT_URL` | `https://api.xiaomimimo.com/api/free-ai/openai/chat` | Upstream MiMo chat endpoint |
+| `--proxy` | - | _(auto-detect live.txt/proxies.txt)_ | Custom proxy list file |
+| `--help` | - | - | Tampilkan usage dan exit |
 
-| Variable | Default | Deskripsi |
-|----------|---------|-----------|
-| `PORT` | `3000` | Port listen |
-| `CHAT_URL` | `https://api.xiaomimimo.com/api/free-ai/openai/chat` | Upstream MiMo chat endpoint |
+### Proxy Checker
+
+```bash
+node proxy-checker.js                          # defaults
+node proxy-checker.js --file proxies.txt       # custom file
+node proxy-checker.js --timeout 5000           # faster timeout
+node proxy-checker.js --json --no-output       # JSON output, no file write
+node proxy-checker.js --help                   # tampilkan semua opsi
+```
 
 ---
 
@@ -529,14 +544,56 @@ Gateway melakukan konversi otomatis antara kedua format. Detail:
 
 ```
 mimo/
+├── args.js            # Shared CLI argument parser
 ├── gateway.js         # Gateway server (utama)
 ├── proxy-manager.js   # Proxy rotation manager
-├── mimo-free.js       # Executor asli (referensi)
+├── proxy-checker.js   # Proxy validator & public IP checker
 ├── package.json       # Config Node.js (type: module)
 ├── live.txt           # Daftar proxy aktif (SOCKS5/HTTP)
 ├── blacklist.txt      # Auto-generated: proxy yang gagal
 └── README.md          # File ini
 ```
+
+---
+
+## CLI Argument Helper (`args.js`)
+
+Modul shared untuk parsing CLI arguments — dipakai `gateway.js` dan `proxy-checker.js`.
+
+```js
+import { getArg, getArgEnv, getIntArgEnv, hasFlag, printUsage } from "./args.js";
+
+// String arg: --name value
+const file = getArg("--file", "live.txt");
+
+// String with env fallback: --name > ENV > default
+const port = getArgEnv("--port", "PORT", 3000);
+
+// Integer with env fallback
+const timeout = getIntArgEnv("--timeout", "TIMEOUT", 10000);
+
+// Boolean flag: --verbose (true if present)
+const verbose = hasFlag("--verbose");
+
+// Auto-generate --help output
+printUsage("My Tool", [
+  { name: "--port", type: "int", default: 3000, description: "Port listen" },
+], "node tool.js [options]");
+```
+
+Fungsi tersedia:
+
+| Fungsi | Deskripsi |
+|--------|-----------|
+| `getArg(name, fallback)` | String arg: `--name value` |
+| `getArgEnv(name, env, fallback)` | String with env fallback |
+| `getIntArg(name, fallback)` | Integer arg |
+| `getIntArgEnv(name, env, fallback)` | Integer with env fallback |
+| `hasFlag(name)` | Boolean flag presence check |
+| `hasNegatableFlag(name, default)` | `--no-X` vs `--X` toggle |
+| `getBoolArg(name, fallback)` | Boolean from `true/false/1/0` string |
+| `printUsage(title, options, example)` | Auto-generate help text |
+| `buildConfig(defs)` | Build config object from definitions |
 
 ---
 

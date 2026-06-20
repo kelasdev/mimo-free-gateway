@@ -31,6 +31,7 @@ import { fileURLToPath } from "url";
 import { SocksProxyAgent } from "socks-proxy-agent";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import https from "https";
+import { getArg, getIntArg, hasFlag, printUsage } from "./args.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -49,26 +50,35 @@ const C = {
   white: "\x1b[37m",
 };
 
-// ─── Config ─────────────────────────────────────────────────────────────────
-const args = process.argv.slice(2);
-
-function getArg(name, fallback) {
-  const idx = args.indexOf(name);
-  if (idx !== -1 && args[idx + 1]) return args[idx + 1];
-  return fallback;
+// ─── CLI Args ────────────────────────────────────────────────────────────────
+if (hasFlag("--help")) {
+  printUsage("Proxy Checker", [
+    { name: "--file",        type: "string", default: "live.txt",                  description: "Proxy list file" },
+    { name: "--timeout",     type: "int",    default: 10000,                       description: "Timeout per proxy (ms)" },
+    { name: "--concurrent",  type: "int",    default: 20,                          description: "Max concurrent checks" },
+    { name: "--ip-service",  type: "string", default: "https://api.ipify.org?format=json", description: "IP check endpoint" },
+    { name: "--output",      type: "string", default: "live-validated.txt",        description: "Output file for valid proxies" },
+    { name: "--no-output",   type: "bool",   description: "Don't write output file" },
+    { name: "--json",        type: "bool",   description: "Output results as JSON" },
+    { name: "--verbose",     type: "bool",   description: "Show all attempts including failures" },
+    { name: "--secure",      type: "bool",   description: "Require valid SSL certs" },
+    { name: "--no-detect",   type: "bool",   description: "Skip auto-detect for bare ip:port" },
+  ], "node proxy-checker.js [options]");
+  process.exit(0);
 }
 
+// ─── Config ─────────────────────────────────────────────────────────────────
 const CONFIG = {
   file: getArg("--file", "live.txt"),
-  timeout: parseInt(getArg("--timeout", "10000"), 10),
-  concurrent: parseInt(getArg("--concurrent", "20"), 10),
+  timeout: getIntArg("--timeout", 10000),
+  concurrent: getIntArg("--concurrent", 20),
   ipService: getArg("--ip-service", "https://api.ipify.org?format=json"),
   output: getArg("--output", "live-validated.txt"),
-  noOutput: args.includes("--no-output"),
-  json: args.includes("--json"),
-  verbose: args.includes("--verbose"),
-  insecure: !args.includes("--secure"),
-  noDetect: args.includes("--no-detect"),
+  noOutput: hasFlag("--no-output"),
+  json: hasFlag("--json"),
+  verbose: hasFlag("--verbose"),
+  insecure: !hasFlag("--secure"),
+  noDetect: hasFlag("--no-detect"),
 };
 
 // Protocols to probe for bare ip:port (in order of likelihood)

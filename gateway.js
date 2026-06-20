@@ -25,6 +25,7 @@ import {
   initProxyManager, proxyFetch, proxyFetchStream, rotateProxy,
   getProxyInfo, getProxyCount, reloadProxies,
 } from "./proxy-manager.js";
+import { getArgEnv, getIntArgEnv, hasFlag, printUsage } from "./args.js";
 
 // ─── ANSI Colors ────────────────────────────────────────────────────────────
 const C = {
@@ -47,11 +48,18 @@ const JWT_EXPIRY_BUFFER_MS = 300000;
 const SESSION_AFFINITY_PREFIX = "ses_";
 const SESSION_ID_LENGTH = 24;
 const SESSION_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789";
-const portIndex = process.argv.indexOf("--port");
-const PORT = parseInt(
-  process.env.PORT || (portIndex !== -1 ? process.argv[portIndex + 1] : "3000"), 10
-);
-const CHAT_URL = process.env.CHAT_URL || "https://api.xiaomimimo.com/api/free-ai/openai/chat";
+// ─── CLI Args ────────────────────────────────────────────────────────────────
+if (hasFlag("--help")) {
+  printUsage("MiMo Free Gateway", [
+    { name: "--port",      env: "PORT",       type: "int",   default: 3000, description: "Port listen" },
+    { name: "--chat-url",  env: "CHAT_URL",   type: "string", default: "https://api.xiaomimimo.com/api/free-ai/openai/chat", description: "Upstream MiMo chat endpoint" },
+    { name: "--proxy",     env: null,         type: "string", description: "Custom proxy list file path" },
+  ], "node gateway.js [--port 3000] [--chat-url https://...]");
+  process.exit(0);
+}
+
+const PORT = getIntArgEnv("--port", "PORT", 3000);
+const CHAT_URL = getArgEnv("--chat-url", "CHAT_URL", "https://api.xiaomimimo.com/api/free-ai/openai/chat");
 
 // Model yang didukung gateway — semua request akan di-override ke model ini
 const SUPPORTED_MODELS = ["mimo-auto"];
@@ -1069,7 +1077,8 @@ const server = http.createServer((req, res) => {
 });
 
 // ─── Init proxy manager ────────────────────────────────────────────────────
-initProxyManager();
+const proxyFile = getArgEnv("--proxy", null, null);
+initProxyManager(proxyFile || undefined);
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`

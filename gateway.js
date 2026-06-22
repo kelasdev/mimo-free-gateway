@@ -22,7 +22,7 @@ import { createHash } from "crypto";
 import os from "os";
 import { PassThrough } from "stream";
 import {
-  initProxyManager, proxyFetch, proxyFetchStream, rotateProxy,
+  initProxyManager, proxyFetch, proxyFetchStream, rotateProxy, rotateProxySoft,
   getProxyInfo, getProxyCount, reloadProxies,
 } from "./proxy-manager.js";
 import { getArgEnv, getIntArgEnv, hasFlag, printUsage } from "./args.js";
@@ -80,6 +80,7 @@ const stats = {
   successRequests: 0,
   failedRequests: 0,
   retriedRequests: 0,
+  rateLimitRetries: 0,
   streamRequests: 0,
   nonStreamRequests: 0,
   openaiRequests: 0,
@@ -452,11 +453,15 @@ async function handleChat(req, res) {
 }
 
 /**
- * Call upstream dengan retry 1x untuk 401/403.
- * Return { status, data?, stream? } — salah satu dari data atau stream.
+ * Upstream forward — retry 1x for 401/403, rotate proxy on 429 (rate limit).
+ * On 429: soft-rotate (no permanent blacklist) and retry immediately.
+ * Max attempts capped at proxy count to avoid infinite loop.
  */
 async function upstreamCall(url, incomingHeaders, bodyStr, stream, sessionId) {
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  const maxAttempts = Math.max(Math.min(getProxyCount(), 8), 2); // 2..8 depending on pool
+  let lastStatus = 0;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     let jwt;
     try { jwt = await bootstrapJwt(); } catch (e) {
       logAuthEvent("LOGOUT", `Bootstrap failed: ${e.message}`);
@@ -464,38 +469,68 @@ async function upstreamCall(url, incomingHeaders, bodyStr, stream, sessionId) {
     }
 
     const headers = buildUpstreamHeaders(incomingHeaders, jwt, stream, sessionId);
+    const proxyInfo = getProxyInfo();
+    const proxyLabel = proxyInfo ? proxyInfo.raw : "direct";
 
     try {
       if (stream) {
         const result = await proxyFetchStream(url, {
           method: "POST", headers, body: bodyStr,
         });
-        if ((result.status === 401 || result.status === 403) && attempt === 1) {
+
+        // Auth fail → hard rotate (blacklist) + invalidate JWT, retry
+        if ((result.status === 401 || result.status === 403) && attempt < maxAttempts) {
           result.stream?.resume();
-          logAuthEvent("LOGOUT", `Auth fail (${result.status}), invalidating JWT`);
+          logAuthEvent("LOGOUT", `Auth fail (${result.status}) via ${proxyLabel}, invalidating JWT`);
           rotateProxy(`auth fail ${result.status}`);
           resetJwtCache();
           continue;
         }
+
+        // Rate limit 429 → soft rotate (no blacklist) + retry
+        if (result.status === 429 && attempt < maxAttempts) {
+          result.stream?.resume(); // drain upstream stream
+          stats.rateLimitRetries = (stats.rateLimitRetries || 0) + 1;
+          console.log(`  ${C.yellow}[proxy]${C.reset} 429 rate-limited via ${proxyLabel}, switching proxy (attempt ${attempt}/${maxAttempts})`);
+          rotateProxySoft(`HTTP 429 rate limit`);
+          continue;
+        }
+
         return { status: result.status, data: "", stream: result.stream };
       } else {
         const result = await proxyFetch(url, {
           method: "POST", headers, body: bodyStr,
         });
-        if ((result.status === 401 || result.status === 403) && attempt === 1) {
-          logAuthEvent("LOGOUT", `Auth fail (${result.status}), invalidating JWT`);
+
+        // Auth fail → hard rotate + invalidate JWT, retry
+        if ((result.status === 401 || result.status === 403) && attempt < maxAttempts) {
+          logAuthEvent("LOGOUT", `Auth fail (${result.status}) via ${proxyLabel}, invalidating JWT`);
           rotateProxy(`auth fail ${result.status}`);
           resetJwtCache();
           continue;
         }
+
+        // Rate limit 429 → soft rotate + retry
+        if (result.status === 429 && attempt < maxAttempts) {
+          stats.rateLimitRetries = (stats.rateLimitRetries || 0) + 1;
+          console.log(`  ${C.yellow}[proxy]${C.reset} 429 rate-limited via ${proxyLabel}, switching proxy (attempt ${attempt}/${maxAttempts})`);
+          rotateProxySoft(`HTTP 429 rate limit`);
+          lastStatus = 429;
+          continue;
+        }
+
         return { status: result.status, data: result.data };
       }
     } catch (e) {
-      if (attempt === 2) return { status: 502, data: JSON.stringify({ error: e.message }) };
+      if (attempt >= maxAttempts) return { status: 502, data: JSON.stringify({ error: e.message }) };
       rotateProxy(`error: ${e.message}`);
       resetJwtCache(); // clear stale JWT so next attempt bootstraps via new proxy
       console.log(`[${new Date().toISOString()}] Error, retry #${attempt}: ${e.message}`);
     }
+  }
+  // If we exhausted all proxies on 429, return 429 so client knows it's rate-limited
+  if (lastStatus === 429) {
+    return { status: 429, data: JSON.stringify({ error: "Rate limited: all proxies exhausted" }) };
   }
   return { status: 502, data: JSON.stringify({ error: "Upstream call failed after retries" }) };
 }
@@ -976,6 +1011,7 @@ const server = http.createServer((req, res) => {
       total_requests: stats.totalRequests,
       success: stats.successRequests,
       failed: stats.failedRequests,
+      rate_limit_retries: stats.rateLimitRetries,
       tokens: { input: stats.inputTokens, output: stats.outputTokens, total: stats.totalTokens },
     });
   }
@@ -1002,6 +1038,7 @@ const server = http.createServer((req, res) => {
         success: stats.successRequests,
         failed: stats.failedRequests,
         retried: stats.retriedRequests,
+        rateLimitRetries: stats.rateLimitRetries,
         stream: stats.streamRequests,
         nonStream: stats.nonStreamRequests,
         openai: stats.openaiRequests,

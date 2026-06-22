@@ -156,6 +156,30 @@ export function rotateProxy(reason) {
   return next;
 }
 
+/**
+ * Rotate proxy WITHOUT permanent blacklist — use for temporary failures
+ * like HTTP 429 (rate limit). The proxy may recover after cooldown.
+ */
+export function rotateProxySoft(reason) {
+  if (allProxies.length === 0) return null;
+  const current = allProxies[currentIndex % allProxies.length];
+  console.log(`  ${C.yellow}[proxy]${C.reset} Skip    ${C.magenta}${current.raw}${C.reset}`);
+  console.log(`           ${C.gray}reason:${C.reset} ${reason}`);
+
+  const start = currentIndex;
+  do {
+    currentIndex = (currentIndex + 1) % allProxies.length;
+    if (currentIndex === start) break;
+  } while (blacklist.has(allProxies[currentIndex]?.raw));
+
+  // No blacklist — just move pointer
+  if (allProxies.length === 0) { console.log(`  ${C.red}[proxy]${C.reset} All proxies exhausted!`); return null; }
+
+  const next = allProxies[currentIndex % allProxies.length];
+  console.log(`  ${C.green}[proxy]${C.reset} Now     ${C.bold}${next.raw}${C.reset} │ ${C.green}${allProxies.length} remaining${C.reset}`);
+  return next;
+}
+
 export function reloadProxies(proxyFile) {
   allProxies = []; currentIndex = 0; blacklist.clear();
   loadBlacklist();
@@ -251,6 +275,6 @@ export function getProxyInfo() {
 }
 
 export default {
-  initProxyManager, getCurrentProxy, getProxyCount, rotateProxy,
+  initProxyManager, getCurrentProxy, getProxyCount, rotateProxy, rotateProxySoft,
   reloadProxies, proxyFetch, proxyFetchStream, getProxyInfo,
 };

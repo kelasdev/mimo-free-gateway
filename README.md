@@ -2,6 +2,7 @@
 
 **Proxy gateway** untuk **MiMo Free API** — memungkinkan agent CLI (seperti [pi](https://github.com/earendil-works/pi-coding-agent)) menggunakan endpoint gratis MiMo tanpa repot urusan JWT, fingerprint, atau anti-abuse marker.
 
+Bahas A.I Driven Engineering [Join Server](https://discord.gg/UZYYbPyXF)
 Cukup arahkan `baseUrl` agent CLI ke gateway ini, dan gateway akan menangani:
 
 - **Model override** — model apapun dari client di-override otomatis ke `mimo-auto`

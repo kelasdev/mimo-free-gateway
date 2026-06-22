@@ -104,12 +104,42 @@ const RECENT_LOG_LIMIT = 20;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+// Random user agents for fingerprint rotation — mimics real MiMoCode CLI installs
+const USER_AGENTS = [
+  "MiMoCode/1.0.0 (Windows NT 10.0; Win64; x64)",
+  "MiMoCode/1.1.0 (Windows NT 10.0; Win64; x64)",
+  "MiMoCode/1.0.2 (Windows NT 10.0; Win64; x64)",
+  "MiMoCode/1.0.1 (Windows NT 10.0; Win64; x64)",
+  "MiMoCode/1.2.0 (Windows NT 10.0; Win64; x64)",
+  "MiMoCode/1.0.0 (Macintosh; Intel Mac OS X 14_5)",
+  "MiMoCode/1.0.2 (Macintosh; Intel Mac OS X 14_4)",
+  "MiMoCode/1.1.0 (Linux; x86_64)",
+];
+
+// Varied CPU models for fingerprint — randomize per bootstrap
+const CPU_MODELS = [
+  "Intel(R) Core(TM) i7-13700K",
+  "Intel(R) Core(TM) i5-13600K",
+  "Intel(R) Core(TM) i9-13900K",
+  "AMD Ryzen 7 7800X3D",
+  "AMD Ryzen 5 7600X",
+  "Intel(R) Core(TM) i7-12700K",
+  "Intel(R) Core(TM) i5-12400",
+  "AMD Ryzen 9 7950X",
+  "Apple M3 Pro",
+  "Apple M2 Max",
+];
+
 function generateFingerprint() {
-  let username = "unknown-user";
-  try { username = os.userInfo().username; } catch { /* ignore */ }
-  const cpu = (os.cpus()[0]?.model || "unknown-cpu").trim();
-  const seed = `${os.hostname()}|${os.platform()}|${os.arch()}|${cpu}|${username}`;
+  // Randomize each component to produce a unique fingerprint per call
+  const cpu = CPU_MODELS[Math.floor(Math.random() * CPU_MODELS.length)];
+  const hostHash = createHash("md5").update(`${Date.now()}|${Math.random()}`).digest("hex").slice(0, 8);
+  const seed = `DESKTOP-${hostHash.toUpperCase()}|win32|${os.arch()}|${cpu}|user`;
   return createHash("sha256").update(seed).digest("hex");
+}
+
+function getRandomUserAgent() {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 }
 
 function generateSessionId() {
@@ -222,7 +252,7 @@ async function bootstrapJwt() {
   const body = JSON.stringify({ client: generateFingerprint() });
   const headers = {
     "Content-Type": "application/json",
-    "User-Agent": "MiMoCode/1.0",
+    "User-Agent": getRandomUserAgent(),
     "Origin": "https://api.xiaomimimo.com",
     "Referer": "https://api.xiaomimimo.com/",
     "X-Mimo-Source": "mimocode-cli-free",
@@ -496,6 +526,31 @@ async function upstreamCall(url, incomingHeaders, bodyStr, stream, sessionId) {
           continue;
         }
 
+        // Risk control 400 (441) → hard rotate + invalidate JWT + retry
+        // MiMo returns HTTP 400 with code 441 "risk_control" for detected bots
+        if (result.status === 400 && attempt < maxAttempts) {
+          let errData = "";
+          result.stream?.on("data", (c) => (errData += c.toString()));
+          result.stream?.resume();
+          // Wait for stream to finish parsing error body
+          await new Promise((r) => {
+            if (!result.stream) return r();
+            result.stream.on("end", r);
+            result.stream.on("error", r);
+            setTimeout(r, 2000);
+          });
+          // Check if it's risk_control (code 441)
+          if (errData.includes("441") || errData.includes("risk_control")) {
+            stats.rateLimitRetries = (stats.rateLimitRetries || 0) + 1;
+            console.log(`  ${C.yellow}[proxy]${C.reset} 441 risk_control via ${proxyLabel}, rotating proxy + new JWT (attempt ${attempt}/${maxAttempts})`);
+            rotateProxySoft(`HTTP 441 risk_control`);
+            resetJwtCache();
+            continue;
+          }
+          // Other 400 — return as-is
+          return { status: result.status, data: errData };
+        }
+
         return { status: result.status, data: "", stream: result.stream };
       } else {
         const result = await proxyFetch(url, {
@@ -519,6 +574,18 @@ async function upstreamCall(url, incomingHeaders, bodyStr, stream, sessionId) {
           continue;
         }
 
+        // Risk control 400 (441) → hard rotate + invalidate JWT + retry
+        if (result.status === 400 && attempt < maxAttempts) {
+          if (result.data && (result.data.includes("441") || result.data.includes("risk_control"))) {
+            stats.rateLimitRetries = (stats.rateLimitRetries || 0) + 1;
+            console.log(`  ${C.yellow}[proxy]${C.reset} 441 risk_control via ${proxyLabel}, rotating proxy + new JWT (attempt ${attempt}/${maxAttempts})`);
+            rotateProxySoft(`HTTP 441 risk_control`);
+            resetJwtCache();
+            lastStatus = 441;
+            continue;
+          }
+        }
+
         return { status: result.status, data: result.data };
       }
     } catch (e) {
@@ -528,9 +595,12 @@ async function upstreamCall(url, incomingHeaders, bodyStr, stream, sessionId) {
       console.log(`[${new Date().toISOString()}] Error, retry #${attempt}: ${e.message}`);
     }
   }
-  // If we exhausted all proxies on 429, return 429 so client knows it's rate-limited
+  // If we exhausted all proxies on 429/441, return so client knows it's rate-limited
   if (lastStatus === 429) {
     return { status: 429, data: JSON.stringify({ error: "Rate limited: all proxies exhausted" }) };
+  }
+  if (lastStatus === 441) {
+    return { status: 429, data: JSON.stringify({ error: "Risk control: all proxies exhausted, try again later" }) };
   }
   return { status: 502, data: JSON.stringify({ error: "Upstream call failed after retries" }) };
 }

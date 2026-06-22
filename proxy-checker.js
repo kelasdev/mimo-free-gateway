@@ -1,41 +1,51 @@
+#!/usr/bin/env node
 /**
- * Proxy Checker — validate proxies & return public IP
+ * proxy-checker.js — Fast Proxy Checker (Node.js)
+ *
+ * Alur pengecekan setiap proxy:
+ *   GET endpoint IP via proxy, verifikasi IP valid.
+ *   Jika proxy bisa mengembalikan IP publik yang valid = WORKING.
+ *
+ * Working proxy LANGSUNG di-append ke output file (incremental save).
+ * Tidak perlu menunggu semua selesai.
  *
  * Usage:
- *   node proxy-checker.js [options]
- *
- * Options:
- *   --file <path>       Proxy list file (default: live.txt)
- *   --timeout <ms>      Timeout per proxy in ms (default: 10000)
- *   --concurrent <n>    Max concurrent checks (default: 20)
- *   --ip-service <url>  IP check endpoint (default: https://api.ipify.org?format=json)
- *   --output <path>     Write valid proxies to file (default: live-validated.txt)
- *   --no-output         Don't write output file, just print results
- *   --json              Output results as JSON
- *   --verbose           Show all attempts including failures
- *   --secure            Require valid SSL certs (default: skip SSL verify)
- *   --no-detect         Skip auto-detect, default bare ip:port to http
- *
- * Bare ip:port entries (no protocol prefix) are auto-detected:
- *   tries http → socks5 → socks4, keeps whichever works.
- *
- * Output format:
- *   Each valid proxy prints: proxy_url | public_ip | detected_protocol | latency_ms
- *
- * Dependencies: socks-proxy-agent, https-proxy-agent (already in project)
+ *   node proxy-checker.js -f proxies.txt
+ *   node proxy-checker.js -f proxies.txt -c 100
+ *   node proxy-checker.js -f proxies.txt --max-working 20
+ *   node proxy-checker.js -u https://example.com/proxies.txt -o live.txt
+ *   node proxy-checker.js -s proxy_sources.txt
  */
 
 import fs from "fs";
 import path from "path";
+import https from "https";
+import http from "http";
 import { fileURLToPath } from "url";
 import { SocksProxyAgent } from "socks-proxy-agent";
 import { HttpsProxyAgent } from "https-proxy-agent";
-import https from "https";
 import { getArg, getIntArg, hasFlag, printUsage } from "./args.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// ─── Konstanta ──────────────────────────────────────────────────────────────
+
+const DEFAULT_TIMEOUT = 5;
+const DEFAULT_CONCURRENT = 100;
+
+const IP_CHECK_SERVICES = [
+  "https://api.ipify.org?format=json",
+  "http://httpbin.org/ip",
+  "https://ifconfig.me/ip",
+];
+
+const IP_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+
+const SUPPORTED_SCHEMES = new Set(["http", "https", "socks4", "socks4h", "socks5", "socks5h"]);
+const SCHEME_ALIAS = { socks: "socks5", socks4h: "socks4", socks5h: "socks5" };
+
 // ─── ANSI Colors ────────────────────────────────────────────────────────────
+
 const C = {
   reset: "\x1b[0m",
   dim: "\x1b[2m",
@@ -51,123 +61,107 @@ const C = {
 };
 
 // ─── CLI Args ────────────────────────────────────────────────────────────────
+
 if (hasFlag("--help")) {
-  printUsage("Proxy Checker", [
-    { name: "--file",        type: "string", default: "live.txt",                  description: "Proxy list file" },
-    { name: "--timeout",     type: "int",    default: 10000,                       description: "Timeout per proxy (ms)" },
-    { name: "--concurrent",  type: "int",    default: 20,                          description: "Max concurrent checks" },
-    { name: "--ip-service",  type: "string", default: "https://api.ipify.org?format=json", description: "IP check endpoint" },
-    { name: "--output",      type: "string", default: "live-validated.txt",        description: "Output file for valid proxies" },
-    { name: "--no-output",   type: "bool",   description: "Don't write output file" },
-    { name: "--json",        type: "bool",   description: "Output results as JSON" },
-    { name: "--verbose",     type: "bool",   description: "Show all attempts including failures" },
-    { name: "--secure",      type: "bool",   description: "Require valid SSL certs" },
-    { name: "--no-detect",   type: "bool",   description: "Skip auto-detect for bare ip:port" },
-  ], "node proxy-checker.js [options]");
+  printUsage(
+    "Proxy Checker — HTTP/HTTPS/SOCKS4/SOCKS5",
+    [
+      { name: "--file", alias: "-f", type: "string", default: "proxies.txt", description: "File berisi daftar proxy" },
+      { name: "--url", alias: "-u", type: "string", description: "URL berisi daftar proxy" },
+      { name: "--sources", alias: "-s", type: "string", default: "proxy_sources.txt", description: "File berisi daftar URL/file sumber proxy" },
+      { name: "--output", alias: "-o", type: "string", default: "live.txt", description: "Output file untuk proxy working" },
+      { name: "--timeout", alias: "-t", type: "int", default: 5, description: "Timeout per proxy dalam detik" },
+      { name: "--concurrent", alias: "-c", type: "int", default: 100, description: "Max concurrent checks" },
+      { name: "--max-working", type: "int", default: 0, description: "Berhenti setelah mendapat N proxy working (0 = semua)" },
+      { name: "--verbose", type: "bool", description: "Tampilkan semua attempt termasuk failure" },
+    ],
+    "node proxy-checker.js -f proxies.txt"
+  );
   process.exit(0);
 }
 
 // ─── Config ─────────────────────────────────────────────────────────────────
+
 const CONFIG = {
-  file: getArg("--file", "live.txt"),
-  timeout: getIntArg("--timeout", 10000),
-  concurrent: getIntArg("--concurrent", 20),
-  ipService: getArg("--ip-service", "https://api.ipify.org?format=json"),
-  output: getArg("--output", "live-validated.txt"),
-  noOutput: hasFlag("--no-output"),
-  json: hasFlag("--json"),
+  file: getArg("-f") || getArg("--file"),
+  url: getArg("-u") || getArg("--url"),
+  sources: getArg("-s") || getArg("--sources") || "proxy_sources.txt",
+  output: getArg("-o") || getArg("--output") || "live.txt",
+  timeout: getIntArg("-t") || getIntArg("--timeout") || DEFAULT_TIMEOUT,
+  concurrent: getIntArg("-c") || getIntArg("--concurrent") || DEFAULT_CONCURRENT,
+  maxWorking: getIntArg("--max-working") || 0,
   verbose: hasFlag("--verbose"),
-  insecure: !hasFlag("--secure"),
-  noDetect: hasFlag("--no-detect"),
 };
 
-// Protocols to probe for bare ip:port (in order of likelihood)
-const PROBE_PROTOCOLS = ["http", "socks5", "socks4"];
+// ─── IP Helpers ─────────────────────────────────────────────────────────────
 
-// ─── Parse proxy lines ──────────────────────────────────────────────────────
-function parseProxyLine(line) {
-  let s = line.trim().replace(/\r$/, "");
-  if (!s || s.startsWith("#")) return null;
+function isValidIP(s) {
+  if (typeof s !== "string") return false;
+  s = s.trim();
+  const m = IP_RE.exec(s);
+  if (!m) return false;
+  return m.slice(1).every((g) => {
+    const n = parseInt(g, 10);
+    return n >= 0 && n <= 255 && String(n) === g;
+  });
+}
 
-  // Detect bare ip:port (no protocol prefix)
-  const hasProtocol = /^[a-z][a-z0-9+.-]*:\/\//i.test(s);
-  const isBare = !hasProtocol;
-
-  if (isBare) {
-    // Quick validation: must look like ip:port
-    const bareMatch = s.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d{1,5})$/);
-    if (!bareMatch) return null;
-
-    const port = parseInt(bareMatch[2], 10);
-    if (port < 1 || port > 65535) return null;
-
-    if (CONFIG.noDetect) {
-      // Default to http
-      s = "http://" + s;
-    } else {
-      // Mark as bare — will be probed later
-      return {
-        protocol: null,
-        host: bareMatch[1],
-        port,
-        user: null,
-        pass: null,
-        raw: line.trim(),
-        url: null,
-        bare: true,
-        bareHost: bareMatch[1],
-        barePort: bareMatch[2],
-      };
+function extractIP(text) {
+  if (!text) return null;
+  text = text.trim();
+  if (isValidIP(text)) return text;
+  try {
+    const data = JSON.parse(text);
+    if (data && typeof data === "object") {
+      for (const key of ["ip", "origin", "query"]) {
+        const v = data[key];
+        if (v && isValidIP(String(v))) return String(v);
+      }
     }
+  } catch {}
+  const m = IP_RE.exec(text);
+  if (m && isValidIP(m[0])) return m[0];
+  return null;
+}
+
+// ─── Proxy class ────────────────────────────────────────────────────────────
+
+class Proxy {
+  constructor({ host, port, protocol, username, password, source }) {
+    this.host = host;
+    this.port = port;
+    this.protocol = protocol;
+    this.username = username || null;
+    this.password = password || null;
+    this.source = source || "";
+    this.ipDetected = null;
+    this.latency = null;
   }
 
-  if (!hasProtocol) {
-    s = "http://" + s;
+  get url() {
+    const scheme = this.protocol;
+    if (this.username) {
+      const u = encodeURIComponent(this.username);
+      const p = encodeURIComponent(this.password || "");
+      return `${scheme}://${u}:${p}@${this.host}:${this.port}`;
+    }
+    return `${scheme}://${this.host}:${this.port}`;
   }
 
-  try {
-    const u = new URL(s);
-    const protocol = u.protocol.replace(":", "").toLowerCase();
-    if (!["http", "https", "socks4", "socks5"].includes(protocol)) return null;
+  get display() {
+    if (this.username) {
+      return `${this.protocol}://${this.username}:***@${this.host}:${this.port}`;
+    }
+    return `${this.protocol}://${this.host}:${this.port}`;
+  }
 
-    const host = u.hostname;
-    const port = parseInt(u.port, 10);
-    if (!host || isNaN(port) || port < 1 || port > 65535) return null;
-
-    const user = u.username ? decodeURIComponent(u.username) : null;
-    const pass = u.password ? decodeURIComponent(u.password) : null;
-
-    return { protocol, host, port, user, pass, raw: line.trim(), url: s, bare: false };
-  } catch {
-    return null;
+  get key() {
+    return `${this.protocol}:${this.host}:${this.port}`;
   }
 }
 
-function loadProxies(filePath) {
-  try {
-    const text = fs.readFileSync(filePath, "utf-8");
-    return text.split("\n").map(parseProxyLine).filter(Boolean);
-  } catch (e) {
-    console.error(`${C.red}Cannot read ${filePath}: ${e.message}${C.reset}`);
-    return [];
-  }
-}
+// ─── HTTP Request Helper ────────────────────────────────────────────────────
 
-// ─── Load blacklist ─────────────────────────────────────────────────────────
-function loadBlacklist() {
-  const blacklist = new Set();
-  const file = path.join(__dirname, "blacklist.txt");
-  try {
-    const text = fs.readFileSync(file, "utf-8");
-    text.split("\n").forEach((l) => {
-      const s = l.trim().replace(/\r$/, "");
-      if (s) blacklist.add(s);
-    });
-  } catch { /* no file */ }
-  return blacklist;
-}
-
-// ─── Build agent ────────────────────────────────────────────────────────────
 function buildAgent(proxy) {
   if (proxy.protocol === "socks4" || proxy.protocol === "socks5") {
     return new SocksProxyAgent(proxy.url);
@@ -175,285 +169,455 @@ function buildAgent(proxy) {
   return new HttpsProxyAgent(proxy.url);
 }
 
-// ─── Raw check (single protocol) ────────────────────────────────────────────
-function rawCheck(proxy, timeout) {
-  return new Promise((resolve) => {
-    const startTime = Date.now();
+function requestViaProxy(proxy, urlStr, options = {}) {
+  return new Promise((resolve, reject) => {
     const agent = buildAgent(proxy);
-    const url = new URL(CONFIG.ipService);
+    const url = new URL(urlStr);
+    const isHttps = url.protocol === "https:";
+    const lib = isHttps ? https : http;
 
     const reqOpts = {
       hostname: url.hostname,
-      port: url.port || 443,
+      port: url.port || (isHttps ? 443 : 80),
       path: url.pathname + url.search,
-      method: "GET",
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json",
-      },
-      timeout,
+      method: options.method || "GET",
+      headers: options.headers || {},
+      timeout: options.timeout || 30000,
       agent,
-      ...(CONFIG.insecure ? { rejectUnauthorized: false } : {}),
+      ...(options.insecure ? { rejectUnauthorized: false } : {}),
     };
 
-    const req = https.request(reqOpts, (res) => {
+    const req = lib.request(reqOpts, (res) => {
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
       res.on("end", () => {
-        const latency = Date.now() - startTime;
-        const body = Buffer.concat(chunks).toString();
-
-        if (res.statusCode === 200) {
-          try {
-            const parsed = JSON.parse(body);
-            const ip = parsed.ip || parsed.query || parsed.origin;
-            if (ip && isValidIP(ip)) {
-              resolve({ success: true, publicIP: ip, latency });
-              return;
-            }
-          } catch {
-            const ipMatch = body.match(/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/);
-            if (ipMatch && isValidIP(ipMatch[0])) {
-              resolve({ success: true, publicIP: ipMatch[0], latency });
-              return;
-            }
-          }
-        }
-        resolve({ success: false, error: `HTTP ${res.statusCode}`, latency });
+        const body = Buffer.concat(chunks).toString("utf-8");
+        resolve({ statusCode: res.statusCode, headers: res.headers, body });
       });
     });
 
-    req.on("error", (e) => {
-      resolve({ success: false, error: e.message, latency: Date.now() - startTime });
-    });
-
+    req.on("error", reject);
     req.on("timeout", () => {
       req.destroy();
-      resolve({ success: false, error: "timeout", latency: Date.now() - startTime });
+      reject(new Error("timeout"));
     });
 
+    if (options.body) req.write(options.body);
     req.end();
   });
 }
 
-// ─── Check single proxy (with auto-detect for bare entries) ─────────────────
-async function checkProxy(proxy) {
-  if (proxy.bare && !CONFIG.noDetect) {
-    return probeBareProxy(proxy);
-  }
+// ─── IP Check (core validation) ─────────────────────────────────────────────
 
-  const result = await rawCheck(proxy, CONFIG.timeout);
-  return {
-    success: result.success,
-    proxy: proxy.raw,
-    publicIP: result.publicIP || null,
-    latency: result.latency,
-    protocol: proxy.protocol,
-    error: result.error || null,
-  };
-}
+async function checkProxy(proxy, timeoutSec) {
+  const timeoutMs = timeoutSec * 1000;
+  const t0 = Date.now();
 
-// ─── Probe bare proxy with multiple protocols ───────────────────────────────
-async function probeBareProxy(proxy) {
-  const probeTimeout = Math.min(CONFIG.timeout, 5000);
-
-  for (const proto of PROBE_PROTOCOLS) {
-    const url = `${proto}://${proxy.bareHost}:${proxy.barePort}`;
-    const probeProxy = {
-      protocol: proto,
-      host: proxy.bareHost,
-      port: proxy.barePort,
-      user: null,
-      pass: null,
-      raw: proxy.raw,
-      url,
-      bare: false,
-    };
-
-    const result = await rawCheck(probeProxy, probeTimeout);
-
-    if (result.success) {
-      return {
-        success: true,
-        proxy: proxy.raw,
-        publicIP: result.publicIP,
-        latency: result.latency,
-        protocol: proto,
-        detected: true,
-        error: null,
-      };
-    }
+  for (const serviceURL of IP_CHECK_SERVICES) {
+    try {
+      const res = await requestViaProxy(proxy, serviceURL, {
+        timeout: timeoutMs,
+        insecure: true,
+        headers: { Accept: "*/*" },
+      });
+      if (res.statusCode === 200) {
+        const ip = extractIP(res.body);
+        if (ip) {
+          return {
+            ok: true,
+            ip,
+            latency: Date.now() - t0,
+            error: null,
+          };
+        }
+      }
+    } catch {}
   }
 
   return {
-    success: false,
-    proxy: proxy.raw,
-    publicIP: null,
-    latency: 0,
-    protocol: null,
-    detected: false,
-    error: "all protocols failed",
+    ok: false,
+    ip: null,
+    latency: Date.now() - t0,
+    error: "ip_check_failed",
   };
 }
 
-// ─── Validate IP format ─────────────────────────────────────────────────────
-function isValidIP(ip) {
-  if (typeof ip !== "string") return false;
-  const parts = ip.split(".");
-  if (parts.length !== 4) return false;
-  return parts.every((p) => {
-    const n = parseInt(p, 10);
-    return !isNaN(n) && n >= 0 && n <= 255 && String(n) === p;
-  });
+// ─── Incremental Saver ──────────────────────────────────────────────────────
+
+class IncrementalSaver {
+  constructor(outputPath) {
+    this.path = path.isAbsolute(outputPath) ? outputPath : path.join(__dirname, outputPath);
+    fs.writeFileSync(this.path, "", "utf-8");
+    this.count = 0;
+  }
+
+  append(proxy) {
+    fs.appendFileSync(this.path, proxy.url + "\n", "utf-8");
+    this.count++;
+  }
 }
 
 // ─── Concurrency limiter ────────────────────────────────────────────────────
-async function runConcurrent(tasks, limit) {
+
+async function runConcurrent(items, limit, fn) {
   const results = [];
   let idx = 0;
 
   async function worker() {
-    while (idx < tasks.length) {
+    while (idx < items.length) {
       const i = idx++;
-      results[i] = await tasks[i]();
+      results[i] = await fn(items[i], i);
     }
   }
 
-  const workers = Array.from({ length: Math.min(limit, tasks.length) }, () => worker());
-  await Promise.all(workers);
+  const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
+  await Promise.allSettled(workers);
   return results;
 }
 
-// ─── Main ───────────────────────────────────────────────────────────────────
-async function main() {
-  const filePath = path.isAbsolute(CONFIG.file) ? CONFIG.file : path.join(__dirname, CONFIG.file);
-  const proxies = loadProxies(filePath);
-  const blacklist = loadBlacklist();
+// ─── Check session ──────────────────────────────────────────────────────────
 
-  const bareCount = proxies.filter((p) => p.bare).length;
-  const activeProxies = proxies.filter((p) => {
-    if (p.bare) return true; // bare entries are always checked (not in blacklist by raw format)
-    return !blacklist.has(p.raw);
-  });
-
-  console.log(`${C.bold}Proxy Checker${C.reset}`);
-  console.log(`${C.gray}─${C.reset}`.repeat(50));
-  console.log(`  File:        ${C.cyan}${filePath}${C.reset}`);
-  console.log(`  Total:       ${proxies.length} proxies`);
-  console.log(`  Bare (ip:port): ${C.magenta}${bareCount}${C.reset} (auto-detect ${CONFIG.noDetect ? "OFF" : "ON"})`);
-  console.log(`  Active:      ${C.green}${activeProxies.length}${C.reset} (after blacklist)`);
-  console.log(`  Blacklisted: ${C.red}${blacklist.size}${C.reset}`);
-  console.log(`  Timeout:     ${CONFIG.timeout}ms`);
-  console.log(`  Concurrent:  ${CONFIG.concurrent}`);
-  console.log(`  IP Service:  ${CONFIG.ipService}`);
-  console.log(`${C.gray}─${C.reset}`.repeat(50));
-  console.log("");
-
-  if (activeProxies.length === 0) {
-    console.log(`${C.yellow}No active proxies to check.${C.reset}`);
-    process.exit(0);
+async function runChecks(proxies, timeoutSec, maxConcurrent, maxWorking, output) {
+  if (proxies.length === 0) {
+    console.log(`\n${C.red}[!] Tidak ada proxy untuk dicek${C.reset}`);
+    return { working: [], checked: 0 };
   }
 
-  const bareActive = activeProxies.filter((p) => p.bare).length;
-  const prefixedActive = activeProxies.filter((p) => !p.bare).length;
-
-  const parts = [];
-  if (prefixedActive > 0) parts.push(`${C.cyan}${prefixedActive}${C.reset} prefixed`);
-  if (bareActive > 0) parts.push(`${C.magenta}${bareActive}${C.reset} bare (probing ${PROBE_PROTOCOLS.join("→")})`);
-  console.log(`${C.yellow}Checking ${activeProxies.length} proxies...${C.reset} (${parts.join(" + ")})\n`);
-
+  const total = proxies.length;
+  const saver = new IncrementalSaver(output);
+  const working = [];
+  let checked = 0;
   const startTime = Date.now();
 
-  const tasks = activeProxies.map((proxy) => () => checkProxy(proxy));
-  const results = await runConcurrent(tasks, CONFIG.concurrent);
+  // Hard timeout: batas mutlak agar satu proxy tidak bisa memblokir selamanya
+  const hardTimeoutMs = timeoutSec * 3 * 1000;
 
-  const valid = results.filter((r) => r.success);
-  const failed = results.filter((r) => !r.success);
-  const detected = valid.filter((r) => r.detected);
+  console.log(`\n${C.cyan}[*] Mengecek ${total} proxy (timeout: ${timeoutSec}s, concurrent: ${maxConcurrent})${C.reset}`);
+  console.log(`${C.gray}[*] Test: GET IP service via proxy -> verifikasi IP valid${C.reset}`);
+  if (maxWorking) {
+    console.log(`${C.yellow}[*] Akan berhenti setelah mendapat ${maxWorking} working proxy${C.reset}`);
+  }
+  console.log("");
 
-  const elapsed = Date.now() - startTime;
+  let stopped = false;
 
-  // Sort valid by latency
-  valid.sort((a, b) => a.latency - b.latency);
+  const results = await runConcurrent(proxies, maxConcurrent, async (proxy) => {
+    if (stopped) return null;
 
-  // Print results
-  if (!CONFIG.json) {
-    if (CONFIG.verbose || failed.length > 0) {
-      console.log(`${C.red}Failed (${failed.length}):${C.reset}`);
-      for (const r of failed) {
-        console.log(`  ${C.red}x${C.reset} ${r.proxy} ${C.gray}| ${r.error} | ${r.latency}ms${C.reset}`);
-      }
-      console.log("");
+    let result;
+    try {
+      result = await Promise.race([
+        checkProxy(proxy, timeoutSec),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("hard_timeout")), hardTimeoutMs)
+        ),
+      ]);
+    } catch (e) {
+      result = {
+        ok: false,
+        ip: null,
+        latency: hardTimeoutMs,
+        error: e.message === "hard_timeout" ? "hard_timeout" : "error",
+      };
     }
 
-    console.log(`${C.green}Valid (${valid.length}):${C.reset}`);
-    for (const r of valid) {
-      const protoTag = r.detected
-        ? `${C.magenta}[${r.protocol}]${C.reset}`
-        : `${C.gray}${r.protocol}${C.reset}`;
+    checked++;
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    const idxStr = `[${checked}/${total}]`;
+
+    if (result.ok) {
+      // Guard: skip jika sudah mencapai limit (race condition antar concurrent worker)
+      if (maxWorking && working.length >= maxWorking) return result;
+
+      proxy.ipDetected = result.ip;
+      proxy.latency = result.latency;
+      saver.append(proxy);
+      working.push(proxy);
+      const currentWorking = working.length;
       console.log(
-        `  ${C.green}+${C.reset} ${r.proxy} ${C.cyan}| ${r.publicIP.padEnd(15)}${C.reset} | ${protoTag} | ${r.latency}ms`
+        `  ${idxStr} ${C.green}[+] WORKING${C.reset} ${proxy.display}` +
+        ` (${result.latency}ms) IP: ${result.ip} -> saved (${currentWorking} total)` +
+        ` ${C.gray}[${elapsed}s]${C.reset}`
+      );
+      if (maxWorking && currentWorking >= maxWorking) {
+        stopped = true;
+      }
+    } else if (checked <= 50 || checked % 200 === 0 || CONFIG.verbose) {
+      console.log(
+        `  ${idxStr} ${C.red}[-] FAIL${C.reset}     ${proxy.display}` +
+        ` (${result.error}) ${C.gray}[${elapsed}s]${C.reset}`
       );
     }
 
-    console.log("");
-    console.log(`${C.gray}─${C.reset}`.repeat(50));
-    console.log(`  ${C.green}Valid: ${valid.length}/${activeProxies.length}${C.reset} │ ${C.red}Failed: ${failed.length}${C.reset} │ ${C.magenta}Detected: ${detected.length}${C.reset} │ ${C.gray}${elapsed}ms total${C.reset}`);
+    return result;
+  });
+
+  return { working, checked };
+}
+
+// ─── Proxy parser ───────────────────────────────────────────────────────────
+
+function inferScheme(name) {
+  const n = name.toLowerCase();
+  if (n.includes("socks5")) return "socks5";
+  if (n.includes("socks4")) return "socks4";
+  if (n.includes("socks")) return "socks5";
+  if (n.includes("https")) return "https";
+  return "http";
+}
+
+function parseProxyLine(line, source, defaultScheme) {
+  line = line.trim();
+  if (!line || line.startsWith("#")) return null;
+  line = line.replace(/\s*#.*$/, "").trim();
+  if (!line) return null;
+
+  const scheme = defaultScheme || "http";
+
+  // Format with explicit scheme
+  if (/^(https?|socks[45]h?):\/\//i.test(line)) {
+    return parseURL(line, source);
   }
 
-  // Write output file — save with detected protocol prefix
-  if (!CONFIG.noOutput && valid.length > 0) {
-    const outputPath = path.isAbsolute(CONFIG.output) ? CONFIG.output : path.join(__dirname, CONFIG.output);
-    const content = valid.map((r) => {
-      if (r.detected) {
-        // Save with detected protocol prefix
-        return `${r.protocol}://${r.proxy}`;
+  // Format user:pass@host:port (no scheme)
+  if (line.includes("@")) {
+    return parseURL(`${scheme}://${line}`, source);
+  }
+
+  // Format columns
+  return parseColumns(line, source, scheme);
+}
+
+function parseURL(raw, source) {
+  try {
+    const u = new URL(raw);
+    let protocol = u.protocol.replace(":", "").toLowerCase();
+    protocol = SCHEME_ALIAS[protocol] || protocol;
+    if (!SUPPORTED_SCHEMES.has(protocol)) return null;
+
+    const host = u.hostname;
+    const port = parseInt(u.port, 10);
+    if (!host || isNaN(port) || port < 1 || port > 65535) return null;
+
+    return new Proxy({
+      host,
+      port,
+      protocol,
+      username: u.username ? decodeURIComponent(u.username) : null,
+      password: u.password ? decodeURIComponent(u.password) : null,
+      source,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function parseColumns(line, source, defaultScheme) {
+  let parts = line.split(/[\t ,]+/).filter(Boolean);
+  if (parts.length === 1) {
+    parts = line.split(":").filter(Boolean);
+  }
+
+  let protocol = defaultScheme;
+
+  if (parts.length === 2) {
+    return makeProxy(protocol, parts[0], parts[1], null, null, source);
+  }
+  if (parts.length === 3) {
+    if (SUPPORTED_SCHEMES.has(parts[0].toLowerCase())) {
+      return makeProxy(parts[0].toLowerCase(), parts[1], parts[2], null, null, source);
+    }
+    return makeProxy(protocol, parts[0], parts[1], null, null, source);
+  }
+  if (parts.length === 4) {
+    if (SUPPORTED_SCHEMES.has(parts[0].toLowerCase())) {
+      return makeProxy(parts[0].toLowerCase(), parts[1], parts[2], parts[3], null, source);
+    }
+    return makeProxy(protocol, parts[0], parts[1], parts[2], parts[3], source);
+  }
+  if (parts.length === 5 && SUPPORTED_SCHEMES.has(parts[0].toLowerCase())) {
+    return makeProxy(parts[0].toLowerCase(), parts[1], parts[2], parts[3], parts[4], source);
+  }
+
+  return null;
+}
+
+function makeProxy(protocol, host, portStr, user, passwd, source) {
+  protocol = SCHEME_ALIAS[protocol] || protocol;
+  try {
+    const port = parseInt(portStr, 10);
+    if (isNaN(port) || port < 1 || port > 65535 || !host) return null;
+    return new Proxy({
+      host,
+      port,
+      protocol,
+      username: user || null,
+      password: passwd || null,
+      source,
+    });
+  } catch {
+    return null;
+  }
+}
+
+// ─── Source loaders ─────────────────────────────────────────────────────────
+
+function loadFromFile(filePath, defaultScheme) {
+  const resolvedPath = path.isAbsolute(filePath) ? filePath : path.join(__dirname, filePath);
+  const scheme = defaultScheme || inferScheme(filePath);
+  const proxies = [];
+  try {
+    const text = fs.readFileSync(resolvedPath, "utf-8");
+    for (const line of text.split("\n")) {
+      const p = parseProxyLine(line, filePath, scheme);
+      if (p) proxies.push(p);
+    }
+    console.log(`  ${C.green}[+] Loaded ${proxies.length} proxy dari ${filePath} (default scheme: ${scheme})${C.reset}`);
+  } catch (e) {
+    if (e.code === "ENOENT") {
+      console.log(`  ${C.red}[-] File tidak ditemukan: ${filePath}${C.reset}`);
+    } else {
+      console.log(`  ${C.red}[-] Error loading ${filePath}: ${e.message}${C.reset}`);
+    }
+  }
+  return proxies;
+}
+
+async function loadFromURL(url, defaultScheme) {
+  const scheme = defaultScheme || inferScheme(url);
+  const proxies = [];
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": "proxy-checker/1.0" },
+      signal: AbortSignal.timeout(15000),
+      redirect: "follow",
+    });
+    if (!res.ok) {
+      console.log(`  ${C.red}[-] Gagal load ${url}: HTTP ${res.status}${C.reset}`);
+      return proxies;
+    }
+    const text = await res.text();
+    for (const line of text.split("\n")) {
+      const p = parseProxyLine(line, url, scheme);
+      if (p) proxies.push(p);
+    }
+    console.log(`  ${C.green}[+] Loaded ${proxies.length} proxy dari ${url} (default scheme: ${scheme})${C.reset}`);
+  } catch (e) {
+    console.log(`  ${C.red}[-] Error loading ${url}: ${e.message}${C.reset}`);
+  }
+  return proxies;
+}
+
+async function loadFromSourcesFile(filePath) {
+  const resolvedPath = path.isAbsolute(filePath) ? filePath : path.join(__dirname, filePath);
+  const allProxies = [];
+  if (!fs.existsSync(resolvedPath)) return allProxies;
+
+  const text = fs.readFileSync(resolvedPath, "utf-8");
+  for (const raw of text.split("\n")) {
+    const entry = raw.trim();
+    if (!entry || entry.startsWith("#")) continue;
+
+    let explicitScheme = null;
+    if (entry.includes("::")) {
+      const idx = entry.indexOf("::");
+      const prefix = entry.substring(0, idx).trim().toLowerCase();
+      if (SUPPORTED_SCHEMES.has(prefix)) {
+        explicitScheme = prefix;
       }
-      return r.proxy; // already has protocol prefix
-    }).join("\n") + "\n";
-    fs.writeFileSync(outputPath, content, "utf-8");
-    console.log(`\n  ${C.green}Saved${C.reset} ${valid.length} valid proxies to ${C.cyan}${outputPath}${C.reset}`);
+    }
+
+    const target = explicitScheme ? entry.substring(entry.indexOf("::") + 2).trim() : entry;
+
+    let batch;
+    if (target.startsWith("http://") || target.startsWith("https://")) {
+      batch = await loadFromURL(target, explicitScheme);
+    } else if (fs.existsSync(target)) {
+      batch = loadFromFile(target, explicitScheme);
+    } else {
+      console.log(`  ${C.red}[-] Sumber tidak ditemukan: ${target}${C.reset}`);
+      continue;
+    }
+    allProxies.push(...batch);
+  }
+  return allProxies;
+}
+
+function deduplicate(proxies) {
+  const seen = new Set();
+  const result = [];
+  for (const p of proxies) {
+    if (!seen.has(p.key)) {
+      seen.add(p.key);
+      result.push(p);
+    }
+  }
+  return result;
+}
+
+// ─── Entry point ────────────────────────────────────────────────────────────
+
+async function main() {
+  console.log(`${C.bold}${"=".repeat(60)}${C.reset}`);
+  console.log(`${C.bold}PROXY CHECKER — HTTP/HTTPS/SOCKS4/SOCKS5${C.reset}`);
+  console.log(`${C.bold}${"=".repeat(60)}${C.reset}`);
+  console.log("");
+  console.log(`${C.cyan}[*] Sumber proxy:${C.reset}`);
+
+  let allProxies = [];
+  const hasExplicit = !!(CONFIG.file || CONFIG.url);
+
+  if (CONFIG.file) {
+    console.log(`  - File: ${CONFIG.file}`);
+    allProxies.push(...loadFromFile(CONFIG.file));
   }
 
-  // JSON output
-  if (CONFIG.json) {
-    const output = {
-      timestamp: new Date().toISOString(),
-      config: {
-        file: CONFIG.file,
-        timeout: CONFIG.timeout,
-        concurrent: CONFIG.concurrent,
-        ipService: CONFIG.ipService,
-        noDetect: CONFIG.noDetect,
-      },
-      summary: {
-        total: proxies.length,
-        bare: bareCount,
-        active: activeProxies.length,
-        valid: valid.length,
-        failed: failed.length,
-        detected: detected.length,
-        elapsedMs: elapsed,
-      },
-      valid: valid.map((r) => ({
-        proxy: r.detected ? `${r.protocol}://${r.proxy}` : r.proxy,
-        publicIP: r.publicIP,
-        latency: r.latency,
-        protocol: r.protocol,
-        detected: r.detected || false,
-      })),
-      failed: CONFIG.verbose
-        ? failed.map((r) => ({
-            proxy: r.proxy,
-            error: r.error,
-            latency: r.latency,
-          }))
-        : undefined,
-    };
-    console.log(JSON.stringify(output, null, 2));
+  if (CONFIG.url) {
+    console.log(`  - URL: ${CONFIG.url}`);
+    allProxies.push(...(await loadFromURL(CONFIG.url)));
   }
 
-  process.exit(valid.length > 0 ? 0 : 1);
+  if (!hasExplicit && fs.existsSync(CONFIG.sources)) {
+    console.log(`  - Sources: ${CONFIG.sources}`);
+    allProxies.push(...(await loadFromSourcesFile(CONFIG.sources)));
+  }
+
+  if (allProxies.length === 0) {
+    console.log("");
+    console.log(`${C.red}[!] Tidak ada proxy yang dimuat!${C.reset}`);
+    console.log(`    Contoh: node proxy-checker.js -f proxies.txt`);
+    console.log(`    Contoh: node proxy-checker.js -u https://example.com/proxies.txt`);
+    console.log(`    Contoh: node proxy-checker.js -s proxy_sources.txt --max-working 20`);
+    process.exit(1);
+  }
+
+  const unique = deduplicate(allProxies);
+  console.log("");
+  console.log(`${C.cyan}[*] Total: ${allProxies.length} | Unique: ${unique.length}${C.reset}`);
+  console.log(`${C.cyan}[*] Output: ${CONFIG.output} (incremental save)${C.reset}`);
+
+  const t0 = Date.now();
+  const { working, checked } = await runChecks(
+    unique,
+    CONFIG.timeout,
+    CONFIG.concurrent,
+    CONFIG.maxWorking,
+    CONFIG.output
+  );
+  const elapsed = (Date.now() - t0) / 1000;
+
+  console.log("");
+  console.log(`${C.bold}${"=".repeat(60)}${C.reset}`);
+  console.log(`${C.bold}RINGKASAN${C.reset}`);
+  console.log(`${C.bold}${"=".repeat(60)}${C.reset}`);
+  console.log(`Total dicek  : ${checked}`);
+  console.log(`Working      : ${working.length}`);
+  console.log(`Output       : ${CONFIG.output}`);
+  console.log(`Waktu        : ${elapsed.toFixed(2)}s`);
+  console.log(`Throughput   : ${(checked / elapsed).toFixed(1)} proxy/detik`);
+  console.log(`${C.bold}${"=".repeat(60)}${C.reset}`);
+
+  process.exit(working.length > 0 ? 0 : 1);
 }
 
 main().catch((e) => {

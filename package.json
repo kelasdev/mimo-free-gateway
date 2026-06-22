@@ -8,9 +8,9 @@
   "scripts": {
     "start": "node gateway.js",
     "start:dev": "node --watch gateway.js",
-    "check": "node proxy-checker.js",
-    "check:verbose": "node proxy-checker.js --verbose",
-    "check:json": "node proxy-checker.js --json --no-output"
+    "check": "node proxy-checker.js -f live.txt",
+    "check:sources": "node proxy-checker.js -s proxy_sources.txt --max-working 20",
+    "check:verbose": "node proxy-checker.js -f live.txt --verbose"
   },
   "dependencies": {
     "https-proxy-agent": "^9.1.0",
